@@ -13,3 +13,5 @@ Then, in cmdr, open the agent's page, create a key, and follow the connect snipp
 To update: `claude plugin marketplace update cmdr-crew`.
 
 This repository is published automatically; changes made here are overwritten.
+
+Copyright (c) 2026 cmdr. All rights reserved. See [LICENSE](LICENSE).
