@@ -1,0 +1,12 @@
+{
+  "name": "cmdr-crew",
+  "owner": { "name": "cmdr", "url": "https://cmdr.it" },
+  "metadata": { "description": "cmdr's plugins for Claude Code: run a session as an agent of a cmdr crew, on your own machine." },
+  "plugins": [
+    {
+      "name": "cmdr",
+      "source": "./plugins/cmdr",
+      "description": "The cmdr channel: a Claude Code session as an agent of its cmdr crew. It hears its conversations, answers with reply, and mirrors a linked terminal to a project's or task's channel. Includes the cmdr-agent command line."
+    }
+  ]
+}

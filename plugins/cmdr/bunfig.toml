@@ -1,0 +1,5 @@
+# Run-time auto-install off (local-agents design 0.1.14, PD-16): a package absent from node_modules is refused,
+# never fetched. The second guard: it binds to this folder as the working directory (`bun run --cwd`, .mcp.json); the
+# first is agent-client/bootstrap.ts, run by start.ts and cli/cmdr-agent.ts from anywhere.
+[install]
+auto = "disable"

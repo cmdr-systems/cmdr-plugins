@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "types": ["node", "bun"],
+    "lib": ["ES2022"]
+  },
+  "include": ["*.ts", "src/**/*.ts", "tests/**/*.ts", "agent-client/**/*.ts", "cli/**/*.ts"]
+}
