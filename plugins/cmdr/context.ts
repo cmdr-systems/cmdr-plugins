@@ -13,6 +13,10 @@
 //     Read once from the start, then only what was added since: a session's
 //     transcript runs to hundreds of megabytes.
 //
+// A compacted session is full (BUGS-9): cmdr.mc reads one with a compaction,
+// or one this channel said is about to compact (`compacting`, the PreCompact
+// hook), as 100%, and Doc restarts it fresh.
+//
 // Pure but for the reads the counter is handed.
 
 /** What the status line hands over, checked. */
@@ -31,8 +35,9 @@ export type StatusContext = {
 /** The session's compactions so far, and when it started (its transcript's first row). */
 export type Compactions = { count: number; lastAt: string | null; startedAt: string | null }
 
-/** What goes to cmdr.mc as `agent:context`. */
-export type ContextReport = Omit<StatusContext, 'transcriptPath'> & { sessionStartedAt: string | null; compactions: number; lastCompactAt: string | null }
+/** What goes to cmdr.mc as `agent:context`. `compacting`: Claude Code is about to compact this session (the PreCompact
+ *  hook, BUGS-9): cmdr.mc reads it as full from then on, and Doc restarts it fresh. */
+export type ContextReport = Omit<StatusContext, 'transcriptPath'> & { sessionStartedAt: string | null; compactions: number; lastCompactAt: string | null; compacting?: true }
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null)
 const str = (v: unknown, max = 200): string | null => (typeof v === 'string' && v.trim() && v.length <= max ? v.trim() : null)

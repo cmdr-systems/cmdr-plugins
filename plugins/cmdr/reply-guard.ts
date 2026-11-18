@@ -10,8 +10,16 @@
 // agent did after it. No reply since, and it ended on written text: that text
 // (its final answer: what it wrote after its last step, not its narration
 // between steps) is unsent, and hook.ts has the channel post it there as the
-// agent. Only if the channel can't be reached does the hook hold the turn
-// open once instead, saying where to send it (Stop: decision "block").
+// agent. Not at once (BUGS-7, 2026-11-18): Claude Code asks the model to close
+// every turn with a short recap, and that recap, written after the last tool
+// call, is indistinguishable here from an answer written as prose; posted,
+// agents answered each other's recaps and looped. So the turn is held open
+// once (Stop: decision "block"), its reminder naming reply and stay_quiet; only
+// if it still ends on text after that hold (stop_hook_active) is that text
+// posted, so a real answer written as prose still reaches the conversation.
+// And a turn that told the channel it's done speaking (stay_quiet, or
+// waiting_on: it said what it's waiting for) has nothing unsent: what it
+// writes after is a note, never posted.
 //
 // The final answer itself comes from the Stop hook's own input
 // (last_assistant_message), never the transcript: Claude Code hasn't always
@@ -28,8 +36,9 @@
 //
 // A reaction says "heard, nothing to add" (reactions.ts): a turn that reacted
 // and wrote nothing after has answered. Words written after it are still its
-// answer and go out, unless all they do is describe the reaction ("Reacted ✅
-// to acknowledge"). A reaction someone made to the agent's message
+// answer and go out (after the hold, as any), unless all they do is describe
+// the reaction ("Reacted ✅ to acknowledge"), however many other steps came
+// between the reaction and the words. A reaction someone made to the agent's message
 // (reaction="…" in its tag) is owed nothing, as task news isn't: what the
 // agent writes after it isn't posted. Except a go-ahead (go_ahead="true": the
 // person it was waiting on ✅'d or 👍'd its message): that's an answer to it,
@@ -86,14 +95,15 @@ export function unsentReply(lines: string[], final?: string): Unsent | null {
   if (at < 0) return null
   // Its final answer: the text after its last step (a tool's use resets it).
   let answer: string[] = []
-  // Its last step was a reaction: what follows may only describe it.
+  // It reacted after the message (any step since): what follows may only describe it.
   let reacted = false
   for (const r of rows.slice(at + 1)) {
     if (r.type !== 'assistant' || !Array.isArray(r.message?.content)) continue
     for (const p of r.message!.content as { type?: string; name?: string; text?: string }[]) {
       if (p?.type === 'tool_use') {
-        if (/__(reply|stay_quiet)$/.test(p.name ?? '')) return null
-        reacted = /__react$/.test(p.name ?? '')
+        // Answered, or done speaking: stay_quiet, or waiting_on (it said what it's waiting for).
+        if (/__(reply|stay_quiet|waiting_on)$/.test(p.name ?? '')) return null
+        reacted ||= /__react$/.test(p.name ?? '')
         answer = []
       }
       if (p?.type === 'text' && p.text) answer.push(p.text)
@@ -105,7 +115,7 @@ export function unsentReply(lines: string[], final?: string): Unsent | null {
   return { chatId: attr(tag, 'chat_id'), threadId: attr(tag, 'thread_id'), conversation: attr(tag, 'conversation'), user: attr(tag, 'user'), text }
 }
 
-/** What the Stop hook tells the agent, holding its turn open. */
+/** What the Stop hook tells the agent, holding its turn open once: its turn ended on text and nothing sent. */
 export function reminder(u: Unsent): string {
-  return `You wrote an answer${u.user ? ` to ${u.user}` : ''}, but nobody sees this session: people only see what you send with the reply tool. Send it now with reply, chat_id "${u.chatId}"${u.threadId ? `, thread_id "${u.threadId}"` : ''}${u.conversation ? ` (${u.conversation})` : ''}. If you meant to stay quiet, use stay_quiet instead.`
+  return `Your turn ended on written text and nothing sent${u.user ? ` to ${u.user}` : ''}${u.conversation ? ` (${u.conversation})` : ''}: nobody sees this session. If that text was your answer, send it now with reply, chat_id "${u.chatId}"${u.threadId ? `, thread_id "${u.threadId}"` : ''}. If nothing was meant for anyone (a recap, a note to yourself), call stay_quiet and write nothing after it. If you end on text again with neither, that text is posted there as you.`
 }

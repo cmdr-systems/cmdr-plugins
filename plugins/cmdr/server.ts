@@ -135,6 +135,8 @@ async function hooksFetch(req: Request): Promise<Response> {
   }
   // A permission request (hook.ts): asked on a card, answered at once.
   if (new URL(req.url).pathname === '/permission') return Response.json(await channel.permission(body))
+  // A compaction about to run (hook.ts PreCompact): told to cmdr.mc; held off only on its word (BUGS-9).
+  if (new URL(req.url).pathname === '/compacting') return Response.json(await channel.compacting(body))
   // How full its context is (statusline.ts): told to cmdr.mc.
   if (new URL(req.url).pathname === '/context') {
     await channel.context(body)
@@ -159,7 +161,11 @@ channel = await startChannel({
   inboxDir: join(STATE_DIR, 'inbox'),
   openSocket: () => {
     const s = client.socket()
-    return Object.assign(s, { out: (event: string, data: unknown) => s.emit(event, data) })
+    return Object.assign(s, {
+      out: (event: string, data: unknown) => s.emit(event, data),
+      // Never buffered for a reconnect: a compaction can't wait for one.
+      ask: (event: string, data: unknown, ms: number) => (s.connected ? s.timeout(ms).emitWithAck(event, data) : Promise.reject(new Error('not connected'))),
+    })
   },
   transport: new StdioServerTransport(),
   witnessDir: WITNESS_DIR,

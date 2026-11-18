@@ -281,6 +281,9 @@ export interface SocketLike {
   close(): unknown
   /** Send to cmdr.mc (socket.io's emit; server.ts gives it this name): activity, and a local session's scope. */
   out?(event: string, data: unknown): unknown
+  /** Send to cmdr.mc and wait for its acknowledgement, at most `ms` (socket.io's emitWithAck); refused at once while
+   *  not connected, never queued for later. A compaction about to run (context.ts) waits on it. */
+  ask?(event: string, data: unknown, ms: number): Promise<unknown>
   off?(event: string, fn: (...args: any[]) => void): unknown
 }
 
@@ -404,6 +407,8 @@ export interface ChannelDeps {
   transcripts?: TranscriptIo
   /** context: at most one report this often (the latest wins; tests shorten it) */
   contextEveryMs?: number
+  /** context: how long a compaction about to run waits on cmdr.mc's acknowledgement before it is let run */
+  compactingAskMs?: number
   /** the continue gate: how long it waits on cmdr.mc for the agent's tasks before deciding without them */
   stopCheckMs?: number
 }
@@ -422,6 +427,9 @@ export interface Channel {
   stopCheck(raw: unknown): Promise<GateVerdict>
   /** The session's status line (statusline.ts): how full its context is, told to cmdr.mc (context.ts). */
   context(raw: unknown): Promise<void>
+  /** Claude Code is about to compact the session (hook.ts's PreCompact, trigger auto): told to cmdr.mc, and whether to
+   *  hold the compaction off (true only when cmdr.mc acknowledged Doc's fresh restart of this session is queued). */
+  compacting(raw: unknown): Promise<{ hold: boolean }>
   /** A turn's prompt (hook.ts's UserPromptSubmit): who opened it, and off the box, mirrored when linked. */
   prompt(raw: unknown): Promise<{ mirrored?: string; refused?: 'no-operator' }>
   /** A turn's final text (hook.ts's Stop, before its guards): off the box, an operator's turn is mirrored when linked. */
@@ -590,7 +598,7 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {}, 'claude/channel/permission': {} } },
       instructions: [
-        `You are ${me.name} (@${me.handle}) on cmdr, your crew's workspace. The people you work with read cmdr, not this session: answer with the reply tool. If you end a turn on a written answer to a message without using reply, that answer is posted to its conversation as you, so never end on notes to yourself. A message that isn't yours to answer (addressed to someone else, an acknowledgement, news you only note) gets stay_quiet, never a written note such as "No action needed": what you write after stay_quiet is not posted.`,
+        `You are ${me.name} (@${me.handle}) on cmdr, your crew's workspace. The people you work with read cmdr, not this session: answer with the reply tool. If you end a turn on written text after a message without using reply, stay_quiet or waiting_on, the turn is held open once to ask which it was, and text you still end on after that is posted to its conversation as you, so never end on notes to yourself. A message that isn't yours to answer (addressed to someone else, an acknowledgement, news you only note) gets stay_quiet, never a written note such as "No action needed": what you write after stay_quiet is not posted.`,
         '',
         ...(!isQueue
           ? [
@@ -600,7 +608,7 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
           : []),
         'Messages arrive as <channel source="cmdr" chat_id="…" conversation="…" user="…" user_kind="user|agent" message_id="…" ts="…">, and a reply in a thread carries thread_id="…" too. Reply with the reply tool, passing chat_id back; a message that came with thread_id is answered in its thread: pass that thread_id back too. To start a thread on a message, pass its message_id as thread_id. Messages are Markdown; write yours in Markdown too.',
         '',
-        'A reaction to a message of yours arrives the same way, marked reaction="…" (its message_id is your message, its thread_id the thread it\'s in): it needs no answer, and anything you write after it without using a tool is not posted. Except a go-ahead: when you said you were waiting on someone (waiting_on) and they react ✅ or 👍 to your message, it arrives marked go_ahead="true": take it as "yes, go ahead", your wait is over, carry on. To acknowledge a message without words (✅ seen, 👀 looking, 🎉), react to it with the react tool: reacting alone says "heard, nothing to add". Anything you write after reacting is posted as your answer, so write only what you mean to say, or nothing. read_history shows each message\'s reactions under it. Never react to a permission card.',
+        'A reaction to a message of yours arrives the same way, marked reaction="…" (its message_id is your message, its thread_id the thread it\'s in): it needs no answer, and anything you write after it without using a tool is not posted. Except a go-ahead: when you said you were waiting on someone (waiting_on) and they react ✅ or 👍 to your message, it arrives marked go_ahead="true": take it as "yes, go ahead", your wait is over, carry on. To acknowledge a message without words (✅ seen, 👀 looking, 🎉), react to it with the react tool: reacting alone says "heard, nothing to add". Anything you write after reacting is your answer (held once, then posted, unless you use reply, stay_quiet or waiting_on) unless it only describes the reaction, so write only what you mean to say, or nothing. read_history shows each message\'s reactions under it. Never react to a permission card.',
         '',
         ...(linkTo('<message_id>')
           ? [`To point someone at a message, link it: ${linkTo('<message_id>')} (a Markdown link, e.g. [the plan](${linkTo('<message_id>')})). It opens that message in cmdr, in its thread when it's a reply. To point someone at a whole thread, link its first message (its thread_id) with ?thread: ${linkTo('<thread_id>')}?thread opens the thread. The link tool makes these for any message (thread: true for its thread), and your reply tool gives the link to each message you send. Never guess one.`, '']
@@ -793,13 +801,13 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
         },
         {
           name: 'stay_quiet',
-          description: "Answer nothing: for a message that isn't yours to answer (addressed to someone else, an acknowledgement, news you only note). Nothing is posted, and nothing you write after it this turn is posted either. Use it instead of writing a note that you're staying quiet.",
+          description: "Answer nothing: for a message that isn't yours to answer (addressed to someone else, an acknowledgement, news you only note). Nothing is posted, and nothing you write after it this turn is posted either. Use it instead of writing a note that you're staying quiet; after it, write nothing.",
           inputSchema: { type: 'object', properties: {} },
         },
         {
           name: 'react',
           description:
-            'React to a message with one emoji, as you (remove: true takes yours back). For a plain acknowledgement, react instead of replying (✅ seen, 👀 looking, 🎉), then stay_quiet. Pass chat_id and the message_id from its <channel> tag (or read_history). One standard Unicode emoji, never a :shortcode:. Never react to a permission card.',
+            'React to a message with one emoji, as you (remove: true takes yours back). For a plain acknowledgement, react instead of replying (✅ seen, 👀 looking, 🎉), then stay_quiet. Text you end the turn on after reacting is held once and then posted as your answer, unless you use reply, stay_quiet or waiting_on, or it only describes the reaction. Pass chat_id and the message_id from its <channel> tag (or read_history). One standard Unicode emoji, never a :shortcode:. Never react to a permission card.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -837,7 +845,7 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
         {
           name: 'waiting_on',
           description:
-            "Say you can't go on until something comes: a person's answer or decision, a review, CI, a deploy. Call it before you end a turn you're stopping only to wait, so you aren't told to carry on and your crew sees what you're waiting for (crew_status). It holds until someone writes to you; say it again if you're still waiting then. Never use it to put off work you could do now: if anything you have is unblocked, do that instead.",
+            "Say you can't go on until something comes: a person's answer or decision, a review, CI, a deploy. Call it before you end a turn you're stopping only to wait, so you aren't told to carry on and your crew sees what you're waiting for (crew_status). It holds until someone writes to you; say it again if you're still waiting then. Never use it to put off work you could do now: if anything you have is unblocked, do that instead. Like stay_quiet, it ends what the turn says: text you write after it is never posted, so send any answer with reply first.",
           inputSchema: {
             type: 'object',
             properties: {
@@ -1918,10 +1926,29 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
       sessionStartedAt: seen?.startedAt ?? was?.sessionStartedAt ?? null,
       compactions: seen?.count ?? was?.compactions ?? 0,
       lastCompactAt: seen?.lastAt ?? was?.lastCompactAt ?? null,
+      // Said about to compact once, the session stays so (cmdr.mc keeps it too; this survives its restart).
+      ...(was?.compacting ? { compacting: true as const } : {}),
     }
     const wait = contextOut + CONTEXT_EVERY_MS - Date.now()
     if (wait <= 0) sendContext()
     else if (!contextTimer) contextTimer = setTimeout(sendContext, wait)
+  }
+
+  // A compaction about to run (hook.ts PreCompact, trigger auto; BUGS-9): cmdr.mc reads the session as full and Doc
+  // queues its fresh restart. The compaction is held off only on cmdr.mc's own word that the restart is queued, within
+  // COMPACTING_ASK_MS: not connected, no answer in time, a cmdr.mc from before (no answer), or no restart (a local
+  // agent, a box not enrolled), and it runs. A compacted session beats one stopped at its window with nobody coming.
+  const COMPACTING_ASK_MS = deps.compactingAskMs ?? 4_000
+  async function compacting(raw: unknown): Promise<{ hold: boolean }> {
+    const sessionId = raw && typeof raw === 'object' && typeof (raw as { sessionId?: unknown }).sessionId === 'string' ? (raw as { sessionId: string }).sessionId : null
+    // Only the session the status line last spoke for: its window and numbers are what cmdr.mc is told.
+    if (!lastContext || !socket.ask || (sessionId !== null && lastContext.sessionId !== sessionId)) return { hold: false }
+    lastContext = { ...lastContext, compacting: true }
+    contextOut = Date.now()
+    const ack = await socket.ask('agent:context', lastContext, COMPACTING_ASK_MS).catch((e) => (log(`context: compacting: ${e}`), null))
+    const hold = !!ack && typeof ack === 'object' && (ack as { restarting?: unknown }).restarting === true
+    stamp(`compacting hold=${hold}`)
+    return { hold }
   }
 
   // `ready`, not `connect`: socket.io's `connect` fires on the namespace
@@ -2105,6 +2132,7 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
     },
     permission: ask,
     context,
+    compacting,
     async stopCheck(raw: unknown) {
       // An operator's turn at the terminal is never held open (design § 3.3, AC-23).
       if (external && opener === 'operator') return { block: false }

@@ -12,7 +12,7 @@
 export type ActivityKind = 'thinking' | 'reading' | 'searching' | 'running' | 'editing' | 'writing' | 'web' | 'tasks' | 'replying' | 'delegating' | 'waiting' | 'other'
 export type Activity = { state: 'working' | 'idle'; kind?: ActivityKind; summary?: string }
 /** What Claude Code hands a hook on stdin (the part read here). */
-export type HookInput = { hook_event_name?: string; tool_name?: string; tool_input?: Record<string, unknown>; cwd?: string; transcript_path?: string; stop_hook_active?: boolean; last_assistant_message?: string; error?: string; /** UserPromptSubmit: the prompt's text */ prompt?: string }
+export type HookInput = { hook_event_name?: string; tool_name?: string; tool_input?: Record<string, unknown>; cwd?: string; transcript_path?: string; stop_hook_active?: boolean; last_assistant_message?: string; error?: string; /** UserPromptSubmit: the prompt's text */ prompt?: string; /** PreCompact: 'auto' or 'manual' */ trigger?: string; session_id?: string }
 
 const MAX = 110
 const KINDS = new Set<string>(['thinking', 'reading', 'searching', 'running', 'editing', 'writing', 'web', 'tasks', 'replying', 'delegating', 'waiting', 'other'])
