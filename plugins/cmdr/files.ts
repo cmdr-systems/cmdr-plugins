@@ -11,7 +11,7 @@
 //             and PDFs too: Claude Code's Read shows it those). A zip is
 //             unpacked beside it, safely (unzip.ts), its files listed.
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
-import { basename, isAbsolute, join } from 'node:path'
+import { basename, isAbsolute, join, sep } from 'node:path'
 import { unpackDirFor, unzipSafely } from './unzip.js'
 
 // agent-client's view (S5); re-exported so this path keeps it (plan D-7).
@@ -39,8 +39,20 @@ export function refusal(path: string): string | null {
   return null
 }
 
-/** A file to send, read; its refusal as an Error. */
-export async function readToSend(path: string): Promise<{ name: string; data: Uint8Array }> {
+/** The name a file is sent under (FEATURE-REQUESTS-8 S3): its own, minus the `<id[:8]>-` this plugin puts on every
+ *  download (`fetchAttachment`, `get_task_file`), and ONLY when the file's real path is under the session's real
+ *  inbox root, at any depth (`<inbox>/<message id>/`, `<inbox>/assets/`, `<inbox>/tasks/<key>/`). A file of the
+ *  agent's own that happens to start with eight hex and a dash keeps its name. A name that would strip to nothing is
+ *  sent whole. The NAME is the one the caller gave (a link keeps its own); only WHERE it is uses the real path. Pure. */
+export function sentName(name: string, realPath: string, realInbox: string | undefined): string {
+  if (!realInbox || !realPath.startsWith(realInbox.endsWith(sep) ? realInbox : realInbox + sep)) return name
+  const stripped = name.replace(/^[0-9a-f]{8}-/i, '')
+  return stripped || name
+}
+
+/** A file to send, read; its refusal as an Error. `inboxRoot`: the session's inbox (FEATURE-REQUESTS-8), so a file
+ *  the plugin downloaded there goes back under the name a person gave it (`sentName`). */
+export async function readToSend(path: string, inboxRoot?: string): Promise<{ name: string; data: Uint8Array }> {
   const why = refusal(path)
   if (why) throw new Error(why)
   // Through any link: what it really is must pass too.
@@ -52,7 +64,8 @@ export async function readToSend(path: string): Promise<{ name: string; data: Ui
   if (!s.isFile()) throw new Error(`${path}: not a file`)
   if (s.size === 0) throw new Error(`${path}: it's empty`)
   if (s.size > MAX_FILE_BYTES) throw new Error(`${path}: over 32 MB`)
-  return { name: basename(path), data: await readFile(real) }
+  const inbox = inboxRoot ? await realpath(inboxRoot).catch(() => undefined) : undefined
+  return { name: sentName(basename(path), real, inbox), data: await readFile(real) }
 }
 
 /** A file's size, as people read it. */

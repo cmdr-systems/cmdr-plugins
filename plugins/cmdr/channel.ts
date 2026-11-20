@@ -1195,7 +1195,7 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
           const uploaded: { id: string; kind: Attachment['kind'] }[] = []
           for (const p of paths) {
             try {
-              const f = await readToSend(p)
+              const f = await readToSend(p, deps.inboxDir)
               const a = await deps.files!.upload(`/agent/conversations/${id}/attachments`, f.name, f.data)
               uploaded.push({ id: a.id, kind: a.kind })
             } catch (e) {
