@@ -11,8 +11,8 @@
 //
 // The gate decides the FIRST delivery, exactly once per spawn: a socket.io
 // reconnect re-emits `ready`, and a harness may list tools more than once,
-// and neither may wake the session again (the persona's startup ceremony is
-// "announce in your home channel", which must not repeat mid-session).
+// and neither may wake the session again (a persona's startup steps must not
+// repeat mid-session).
 //
 // The belt (WakeBelt, below) is a separate observation: whether a TURN
 // started on the wake, seen as a step from the session's own hooks

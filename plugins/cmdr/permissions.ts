@@ -1,6 +1,6 @@
 // Permission requests, without stopping the agent: when Claude Code would ask
 // before it acts, the plugin's PermissionRequest hook (hook.ts) hands the
-// request to the channel, which puts a card in the agent's home channel on
+// request to the channel, which puts a card in the agent's crew's general channel on
 // cmdr (cmdr.mc: POST /agent/permissions) and answers the hook AT ONCE: allowed
 // when cmdr.mc decided on the spot (the crew's rules or risk tolerance cover
 // it), otherwise refused for now, saying it was asked. The agent keeps
@@ -353,16 +353,16 @@ const AT_THE_TERMINAL = new Set(['AskUserQuestion'])
 export const say = {
   atTheTerminal: (tool: string) =>
     AT_THE_TERMINAL.has(tool) ? `Nobody sees this session, so ${tool} can't be answered. Ask in the conversation with reply instead, end your turn, and you'll hear the answer as a message.` : null,
-  asked: (what: string, home: string) =>
-    `Not yet: this needs permission (${what}). The people who direct your crew have been asked on a card in #${home}. You're not blocked: keep answering messages and carry on with anything that doesn't need this. Don't try to get the same result another way. You'll get a message when they decide; if they allow it, make exactly this call again and it will go through.`,
-  stillAsked: (what: string, home: string) =>
-    `Still waiting for permission (${what}): it's on a card in #${home}, not decided yet. Carry on with something else; you'll get a message when they decide.`,
-  refusedNow: (what: string) => `Refused: your crew's rules don't allow this (${what}). Don't try it another way; if you need it, say why in your home channel.`,
-  nowhere: (what: string) => `Refused: this needs permission (${what}) and there's no home channel to ask in. Don't try it another way; say what you need with reply.`,
+  asked: (what: string, channel: string) =>
+    `Not yet: this needs permission (${what}). The people who direct your crew have been asked on a card in #${channel}. You're not blocked: keep answering messages and carry on with anything that doesn't need this. Don't try to get the same result another way. You'll get a message when they decide; if they allow it, make exactly this call again and it will go through.`,
+  stillAsked: (what: string, channel: string) =>
+    `Still waiting for permission (${what}): it's on a card in #${channel}, not decided yet. Carry on with something else; you'll get a message when they decide.`,
+  refusedNow: (what: string) => `Refused: your crew's rules don't allow this (${what}). Don't try it another way; if you need it, say why in your crew's general channel.`,
+  nowhere: (what: string) => `Refused: this needs permission (${what}) and your crew has no general channel to ask in. Don't try it another way; say what you need with reply.`,
   tooLong: (what: string, scratchpad: string) =>
     `Refused: this command is too long for anyone to review on a permission card (${what}). Write it to a script file in your scratchpad directory (under ${scratchpad}/) with the Write tool, then run that file as a single command (e.g. \`bash <path>\` or \`python3 <path>\`): the card shows the script, and asks once.`,
   unreachable: (what: string) => `Refused for now: this needs permission (${what}) and cmdr couldn't be reached to ask. Don't try it another way; try again in a few minutes.`,
   allowed: (what: string) => `Permission granted (${what}). Make exactly the same call again now and it will go through, once; then carry on where you left off. No need to reply to this.`,
-  refused: (what: string) => `Permission refused (${what}). Don't do it, and don't try to get the same result another way; if you still need it, explain why in your home channel. No need to reply to this.`,
+  refused: (what: string) => `Permission refused (${what}). Don't do it, and don't try to get the same result another way; if you still need it, explain why in your crew's general channel. No need to reply to this.`,
   withdrawn: (what: string) => `Your permission request (${what}) is no longer waiting: nobody decided it. If you still need it, make the call again to ask again. No need to reply to this.`,
 }

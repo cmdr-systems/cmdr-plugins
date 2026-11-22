@@ -10,7 +10,7 @@
 //             reaches anyone
 //
 // What it hears: every message in its private and group conversations; in
-// its crew's channels, its role's home channel and anything that @-mentions
+// every channel, its crew's general channel too, anything that @-mentions
 // it. Never its own messages. On start it catches up on what arrived while
 // it was away (its unread), and whatever it's handed counts as read. The
 // session opens with the `startup` wake, before any of it (channel.ts).
@@ -27,8 +27,8 @@
 //                         Default ~/.claude/channels/cmdr
 //   CREW_HEALTH_DIR       the per-agent witness export dir, when provisioning
 //                         renders it (heartbeat · model-progress · delivered)
-//   CMDR_AGENT_ARCHETYPE  the assembler's archetype, the home-channel fallback
-//                         when cmdr.mc's /agent/me carries none
+//   CMDR_AGENT_ARCHETYPE  the assembler's archetype, the fallback (the queue's and
+//                         offers') when cmdr.mc's /agent/me carries none
 //   CMDR_APP_URL          cmdr.app, for links to messages (<url>/m/<message_id>).
 //                         Default: CMDR_API_URL with its api. host as app.
 //                         (https://api.cmdr.it → https://app.cmdr.it); neither, no links

@@ -17,7 +17,7 @@
 //
 // And the bots this agent is told (`bots`): cmdr.mc's own authors (a message
 // only cmdr.mc itself writes, never a person): `deploy`, which reports pull
-// requests and deploys (an agent's own PR cards in its home, everything in
+// requests and deploys (a pull request's card where it lives, everything in
 // the organization's #prs and #deploy feeds), admitted for every agent; and
 // `tasks`, the queue's. Which of their messages wake an agent is hearsOf's
 // (below).
@@ -81,34 +81,35 @@ export class Admission {
   }
 }
 
-/** Each role's home channel (cmdr.app's HOME): where it answers everything.
- *  Keyed on BOTH archetype vocabularies: cmdr.mc calls the QA role `qa`, the
- *  assembler's closed set (assembler/src/core/types.ts ARCHETYPES) calls it
- *  `qa-auditor`, and either may be the one we're handed. */
-export const HOME: Readonly<Record<string, string>> = {
+/** A crew's one channel of its own (general crew channel design § 3.1): the slot never changes, its label may. No
+ *  agent has a channel of its own there or anywhere: it hears what names it and the threads it is in. */
+export const GENERAL = 'general'
+
+/** A crew's `#tasks`, while its organization has not archived its role channels: where the Queue's feed still is
+ *  between this plugin and that archive. The arm goes with the cleanup (design § 3.4, R-2). */
+const LEGACY_TASKS = 'tasks'
+
+/** The role channels a crew had before the general channel, by archetype, in both vocabularies (cmdr.mc's `qa`, the
+ *  assembler's `qa-auditor`). Kept for ONE release and for one reader: a permission card's address in a crew whose
+ *  cmdr.mc has no general channel for it yet (channel.ts askWhere). Nothing is heard by it. */
+const RETIRED_ROLE_CHANNEL: Readonly<Record<string, string>> = {
   architect: 'architecture',
   builder: 'build',
   'qa-auditor': 'quality',
-  qa: 'quality', // cmdr.mc's name for qa-auditor
+  qa: 'quality',
   enforcer: 'security',
   doc: 'health',
-  queue: 'tasks',
+  queue: LEGACY_TASKS,
+}
+export function retiredRoleChannel(archetype: string | undefined | null): string | null {
+  return RETIRED_ROLE_CHANNEL[(archetype ?? '').trim()] ?? null
 }
 
-/** The home channel's slot for an archetype; null for `custom` or unknown
- *  (DMs and @-mentions only). */
-export function homeFor(archetype: string | undefined | null): string | null {
-  return HOME[(archetype ?? '').trim()] ?? null
-}
+/** Whether this archetype is its crew's Queue: the one agent that hears the `tasks` bot's feed lines. */
+export const isQueueArchetype = (archetype: string | undefined | null): boolean => (archetype ?? '').trim() === 'queue'
 
-/** The crew's task channel: the queue's home, where tasks are taken in and
- *  work is offered. Everyone else hears it as any other channel that isn't
- *  their home: when they're @-mentioned (Adrian, 2026-10-29). Its feed bot
- *  is the queue's alone. */
-export const TASKS = 'tasks'
-
-/** cmdr's own bots, every agent's to read (admission): deploy (PR cards in our home, the #prs and #deploy feeds),
- *  tasks (the queue's news in #tasks; a nudge in our home when we've stalled), and Doc, cmdr's health agent in every
+/** cmdr's own bots, every agent's to read (admission): deploy (pull requests' cards, the #prs and #deploy feeds),
+ *  tasks (the queue's news; a nudge in a task's channel when we've stalled on it), and Doc, cmdr's health agent in every
  *  organization (cmdr.mono #673, 2026-11-17: its cards, and its word to us when our context is heavy). One list for
  *  the box's plugin and a local agent's cmdr-agent: Doc was withheld as "not one of this crew's people" (2026-11-17). */
 export const ADMITTED_BOTS: readonly string[] = ['deploy', 'tasks', 'doc']
@@ -130,35 +131,39 @@ function escape(s: string) {
 }
 
 /** Whether this message is for us: where it is, and whether it names us (or answers in a thread we're in). Who wrote it
- *  is admission's. Pure: built once per session from who we are. */
-export type HearsView = { me: Pick<Author, 'id'>; home: string | null; isQueue: boolean; mention: RegExp }
+ *  is admission's. Pure: built once per session from who we are. No channel is ours to hear whole but our private and
+ *  group conversations and a custom channel seated `all` (general crew channel design § 3.4, AC-4). */
+export type HearsView = { me: Pick<Author, 'id' | 'crewKey'>; isQueue: boolean; mention: RegExp }
 export const hearsOf =
-  ({ me, home, isQueue, mention }: HearsView) =>
+  ({ me, isQueue, mention }: HearsView) =>
   (c: Conversation, m: Message): boolean => {
-    // Our own message never comes back to us, but one: the queue's task news, which cmdr.mc posts as the queue (in #tasks).
-    if (m.author?.kind === 'agent' && m.author.id === me.id) return isQueue && !!m.feed && c.kind === 'channel' && c.slot === TASKS
-    // Task news and task cards are for people (and the news, the queue's): another agent hears a card only when it's mentioned in it, and the news never.
-    if (m.feed) return isQueue && m.author?.kind === 'bot' && c.kind === 'channel' && c.slot === TASKS
+    // Our own message never comes back to us, but one, while it lasts: in an organization that has not archived its
+    // role channels cmdr.mc still posts the queue's lines and task news in `#tasks` AS the Queue (crewFeedInGeneral
+    // false), and a Queue deaf to those would stop offering work. Once archived, the `tasks` bot writes every line and
+    // this arm hears nothing; it goes with the cleanup, beside LEGACY_TASKS.
+    if (m.author?.kind === 'agent' && m.author.id === me.id) return isQueue && !!m.feed && c.kind === 'channel' && c.slot === LEGACY_TASKS
+    // Task news and the queue's own lines are for people and for the crew's Queue: in a project's channel (every queue
+    // of a crew on the project hears it there), in its own crew's general channel, and in its `#tasks` while that
+    // still exists. Another agent hears the news never.
+    if (m.feed) return isQueue && m.author?.kind === 'bot' && c.kind === 'channel' && (!!c.projectId || (!!me.crewKey && c.crewKey === me.crewKey && (c.slot === GENERAL || c.slot === LEGACY_TASKS)))
+    // A task's card is for people: another agent hears it only when it's mentioned in it.
     if (m.task && !mention.test(m.body)) return false
     // Another agent's permission card is for the people who decide it, not for us; and a card saying an agent isn't
-    // connected (cmdr's agent-notice, agent error card design 0.1.4 § 2) is for the people waiting on it: never heard,
-    // not even in our home, where a bot's message is otherwise heard unnamed.
+    // connected (cmdr's agent-notice, agent error card design 0.1.4 § 2) is for the people waiting on it: never heard.
     if (m.permission || m.agentNotice) return false
     // A custom channel we read only (custom channels design 0.1.6 § 3.5, CC-6): nothing in it wakes us, a bot naming us
     // included. `mode` absent (an older cmdr.mc) reads as mentions: never more than the server said.
     if (c.kind === 'channel' && c.custom && c.mode === 'read') return false
-    // A bot speaks to us in our home (the cards of the pull requests we open, the deploys that carry them, the task feed
-    // in #tasks), and in any other channel that isn't a feed when it names us: a pull request's card in its task's
-    // channel says `by @handle`, and its notices open with `@handle` (PR-routing design 0.3.3 §3.3). Never in the
-    // organization's #prs and #deploy feeds, even named: those we read, unasked.
-    if (m.author?.kind === 'bot') return c.kind === 'channel' && !isFeed(c) && ((!!home && c.slot === home) || (!!c.custom && c.mode === 'all') || mention.test(m.body))
+    // A bot is heard when it names us, in any channel: a pull request's card says `by @handle`, its notices and a nudge
+    // open with `@handle`. In the organization's feeds too (#prs, #deploy, #actions): a card there wakes the agent it
+    // names and never another (design 0.1.18). Unnamed, a bot is heard nowhere but a custom channel seated `all`.
+    if (m.author?.kind === 'bot') return c.kind === 'channel' && ((!!c.custom && c.mode === 'all') || mention.test(m.body))
     if (c.kind !== 'channel') return true
     // A custom channel we hear all of (its owners and admins chose it).
     if (c.custom && c.mode === 'all') return true
     // Named on the record: typed, or carried forward by cmdr.mc from whoever was named last (speaking-policy design §3.3).
     // The own-message drop above stays first (AC-18): a session never hears its own persona, however it's named.
-    // A home of null (a local agent) is no channel's: a deliverable's slot is null too, and must not read as home.
-    return (home !== null && c.slot === home) || mention.test(m.body) || (m.mentionedAgentIds ?? []).includes(me.id) || (!!m.threadRootId && (m.threadAgentIds ?? []).includes(me.id))
+    return mention.test(m.body) || (m.mentionedAgentIds ?? []).includes(me.id) || (!!m.threadRootId && (m.threadAgentIds ?? []).includes(me.id))
   }
 
 /** The design's Port (agent-client API: `Hearing.create(me, people)`): admission and hearing for one session. The
@@ -169,8 +174,8 @@ export const Hearing = {
     people: () => Promise<Person[]>,
     opts: { archetype?: string | null; log: (line: string) => void; now?: () => number; refreshMs?: number; unknownRefreshMs?: number; bots?: readonly string[] },
   ) {
-    const home = homeFor(me.archetype ?? opts.archetype)
+    const isQueue = isQueueArchetype(me.archetype ?? opts.archetype)
     const admission = new Admission(people, me.crewKey, me.id, opts.log, opts.now ?? Date.now, opts.refreshMs, opts.unknownRefreshMs, opts.bots ?? [])
-    return { admission, home, hears: hearsOf({ me, home, isQueue: home === TASKS, mention: mentionOf(me) }), roleOf: (author: Author | null) => admission.roleOf(author) }
+    return { admission, isQueue, hears: hearsOf({ me, isQueue, mention: mentionOf(me) }), roleOf: (author: Author | null) => admission.roleOf(author) }
   },
 } as const
