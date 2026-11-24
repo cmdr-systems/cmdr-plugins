@@ -253,6 +253,9 @@ const LAUNCHER = 'launcher'
 const KEY_FILE = 'agent.key'
 const CONFIG_FILE = 'config.json'
 const STATE_FILE = 'state.json'
+/** How long install waits for launchd to finish booting out an old launcher before bootstrapping the new one. */
+const BOOTOUT_WAIT_MS = 10_000
+const BOOTOUT_POLL_MS = 250
 const EVENTS_FILE = 'events.log'
 const LOCK_FILE = 'launcher.lock'
 
@@ -427,7 +430,16 @@ async function install(o: Opts, deps: LaunchDeps) {
           ['systemctl', '--user', 'enable', `${unit.label}.service`],
           ['systemctl', '--user', 'restart', `${unit.label}.service`],
         ]
-  if (deps.platform === 'darwin') await deps.run(['launchctl', 'bootout', `gui/${deps.uid}/${unit.label}`], SERVICE_TIMEOUT_MS)
+  if (deps.platform === 'darwin') {
+    // A launcher already loaded (the snippet pasted again) is booted out first. bootout returns before launchd has
+    // finished taking the old one down, and a bootstrap in that window is refused "Bootstrap failed: 5: Input/output
+    // error" (Adrian's Mac, 2026-11-24 05:33Z: the old launcher stopped, the new one never started). So wait until
+    // launchd no longer knows the label, up to BOOTOUT_WAIT_MS, before bootstrapping.
+    const target = `gui/${deps.uid}/${unit.label}`
+    await deps.run(['launchctl', 'bootout', target], SERVICE_TIMEOUT_MS)
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+    for (let waited = 0; waited < BOOTOUT_WAIT_MS && (await deps.run(['launchctl', 'print', target], SERVICE_TIMEOUT_MS)).code === 0; waited += BOOTOUT_POLL_MS) await sleep(BOOTOUT_POLL_MS)
+  }
   for (const s of steps) {
     const p = await deps.run(s, SERVICE_TIMEOUT_MS)
     if (p.code !== 0) refuse('service-failed', firstLine(p))
