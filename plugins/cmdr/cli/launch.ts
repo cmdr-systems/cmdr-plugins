@@ -49,6 +49,10 @@ export type LaunchState = {
   /** 0..2: the index into BACKOFF_STEPS_MS of the next early-exit wait */
   backoffStep: 0 | 1 | 2
   backoffUntil: string | null
+  /** The handle its session is named by (design 0.2.25/0.2.26): `/agent/me`'s, recorded when the daemon renames the
+   *  session or `install` reuses a renamed agent's home (0.2.24). Absent: config.json's. The home, folder and unit keep
+   *  config.json's handle; only the session follows a rename. */
+  handle?: string
 }
 export const FRESH_STATE: LaunchState = Object.freeze({ stopped: false, lastStartAt: null, lastEndAt: null, backoffStep: 0, backoffUntil: null })
 
@@ -59,6 +63,9 @@ export const BACKOFF_STEPS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const
 export const TICK_MS = 30_000
 /** A refused key: `/agent/me` again this often, staying up (design § 3.3 step 3, AC-7). */
 export const REFUSED_RETRY_MS = 5 * 60_000
+/** With the session up, `/agent/me` on the daemon's first tick and then every this many ticks (every 5 minutes): a
+ *  rename or a removal reaches a running agent (design 0.2.26 § 3.3 step 1, LS-35). */
+export const HANDLE_POLL_TICKS = 10
 /** tmux commands, and a spawn that has produced no session (design § 5). */
 export const TMUX_TIMEOUT_MS = 5_000
 export const SPAWN_DEADLINE_MS = 5_000
@@ -70,7 +77,7 @@ export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -102,6 +109,11 @@ export function tmuxVersionOk(v: string): boolean {
 /** The agent's one tmux session (design 0.2.4 § 3.3): `cmdr_<crew>_<handle>`. `_` is in neither a crew key nor a
  *  handle (`^[a-z0-9-]{1,40}$`), so two agents never share a name, even two crews' `scout` on one machine. */
 export const sessionName = (crew: string, handle: string): string => `cmdr_${crew}_${handle}`
+/** The session as it's named now: by the handle the daemon recorded (a rename, 0.2.25), else config.json's. Every verb
+ *  that names the session uses this, so `status`'s attach line names the session that exists (0.2.26). */
+export const sessionOf = (config: Pick<LaunchConfig, 'crew' | 'handle'>, st: Pick<LaunchState, 'handle'>): string => sessionName(config.crew, st.handle ?? config.handle)
+/** A handle as cmdr.mc makes one (crew-rules HANDLE): anything else read from a file or an answer is ignored. */
+const HANDLE = /^[a-z][a-z0-9-]{1,23}$/
 
 /** The launcher's own tmux server (design 0.2.22): every tmux call and printed attach line uses `-L cmdr`, so it never
  *  meets the person's own tmux, of another version. */
@@ -377,6 +389,23 @@ function installed(home: string): { dir: string; key: string; config: LaunchConf
   return { dir, key, config: config! }
 }
 
+/** The launcher homes under ~/.cmdr/agents whose config.json carries this agent id (design 0.2.24): the same
+ *  enumeration the desktop's `local_agents` uses. */
+function homesOfAgent(deps: LaunchDeps, agentId: string): string[] {
+  const root = join(deps.userHome, '.cmdr', 'agents')
+  const found: string[] = []
+  try {
+    for (const crew of readdirSync(root)) {
+      for (const handle of readdirSync(join(root, crew))) {
+        if (readJson<Partial<LaunchConfig>>(join(root, crew, handle, LAUNCHER, CONFIG_FILE))?.agentId === agentId) found.push(join(root, crew, handle))
+      }
+    }
+  } catch {
+    // none
+  }
+  return found
+}
+
 /** `--home`, else the one launcher home under ~/.cmdr/agents (no environment is read: design § 3.1). */
 function homeOf(deps: LaunchDeps, given: string | undefined): string {
   if (given) return given.replace(/^~(?=\/|$)/, deps.userHome)
@@ -437,7 +466,7 @@ const readStateFile = (dir: string): LaunchState => {
   if (!j) return { ...FRESH_STATE }
   const iso = (v: unknown) => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? v : null)
   const step = j.backoffStep === 1 || j.backoffStep === 2 ? j.backoffStep : 0
-  return { stopped: j.stopped === true, ...(j.stopped === true && j.stoppedReason === 'agent-removed' ? { stoppedReason: 'agent-removed' as const } : {}), lastStartAt: iso(j.lastStartAt), lastEndAt: iso(j.lastEndAt), backoffStep: step, backoffUntil: iso(j.backoffUntil) }
+  return { stopped: j.stopped === true, ...(j.stopped === true && j.stoppedReason === 'agent-removed' ? { stoppedReason: 'agent-removed' as const } : {}), lastStartAt: iso(j.lastStartAt), lastEndAt: iso(j.lastEndAt), backoffStep: step, backoffUntil: iso(j.backoffUntil), ...(typeof j.handle === 'string' && HANDLE.test(j.handle) ? { handle: j.handle } : {}) }
 }
 const writeStateFile = (dir: string, st: LaunchState) => writeWhole(join(dir, STATE_FILE), `${JSON.stringify(st, null, 2)}\n`, 0o600)
 /** The session's `activity.state` (the plugin writes it; the launcher only reads it, for `status`). */
@@ -492,7 +521,15 @@ async function install(o: Opts, deps: LaunchDeps) {
   if (!existsSync(join(plugin, 'cli', 'cmdr-agent.ts'))) refuse('usage', `no cli/cmdr-agent.ts in ${plugin}: --plugin <the cmdr plugin's folder>`)
   const crew = me.crewKey ?? 'crew'
   const stateDir = deps.env.CMDR_STATE_DIR?.trim().replace(/^~(?=\/|$)/, deps.userHome)
-  const home = o.opt.home ? o.opt.home.replace(/^~(?=\/|$)/, deps.userHome) : stateDir ? dirname(dirname(stateDir)) : join(deps.userHome, '.cmdr', 'agents', crew, me.handle ?? me.id)
+  // The home this agent already has, found by its id (design 0.2.24, AC-38): renamed in cmdr since, its snippet names a
+  // home under the new handle, and installing there would run a second launcher for one agent. Two such homes are
+  // never guessed between.
+  const ours = homesOfAgent(deps, me.id)
+  if (ours.length > 1) refuse('duplicate-home', `more than one launcher on this machine is this agent's: ${ours.join(', ')}. Remove all but one (launch uninstall --home <dir>)`)
+  const home = ours[0] ?? (o.opt.home ? o.opt.home.replace(/^~(?=\/|$)/, deps.userHome) : stateDir ? dirname(dirname(stateDir)) : join(deps.userHome, '.cmdr', 'agents', crew, me.handle ?? me.id))
+  // A reused home keeps its own handle (its folder, unit and config are named by it); its session follows /agent/me's.
+  const keptHandle = ours[0] ? readJson<Partial<LaunchConfig>>(join(home, LAUNCHER, CONFIG_FILE))?.handle : undefined
+  const homeHandle = typeof keptHandle === 'string' && HANDLE.test(keptHandle) ? keptHandle : (me.handle ?? me.id)
   // The session finds bun and claude as this shell did (LS-3, AC-16): its PATH, with bun's folder if absent.
   const bunDir = dirname(deps.bunPath)
   const parts = path.split(':').filter(Boolean)
@@ -506,7 +543,7 @@ async function install(o: Opts, deps: LaunchDeps) {
     ...(deps.env.CMDR_APP_URL?.trim() ? { appUrl: deps.env.CMDR_APP_URL.trim() } : {}),
     agentId: me.id,
     crew,
-    handle: me.handle ?? me.id,
+    handle: homeHandle,
     claude: claude!,
     tmux: tmux!,
     bun: deps.bunPath,
@@ -515,10 +552,10 @@ async function install(o: Opts, deps: LaunchDeps) {
     // Never the home folder (design 0.2.11, R-8): Claude Code keeps no trust for it, so every unattended start there
     // stalls at its prompt. Default: a folder of the agent's own, made here, by crew and handle so two crews' agents of
     // one handle never share one (launcher design 0.2.13, LS-27).
-    cwd: (o.opt.cwd ?? keptCwd ?? join(deps.userHome, 'cmdr', crew, me.handle ?? me.id)).replace(/^~(?=\/|$)/, deps.userHome).replace(/\/+$/, '') || '/',
+    cwd: (o.opt.cwd ?? keptCwd ?? join(deps.userHome, 'cmdr', crew, homeHandle)).replace(/^~(?=\/|$)/, deps.userHome).replace(/\/+$/, '') || '/',
   }
   if (config.cwd === deps.userHome.replace(/\/+$/, '')) refuse('cwd-is-home', `the agent can't work in your home folder: Claude Code never keeps trust for it. Leave --cwd out (it uses ~/cmdr/${config.crew}/${config.handle}) or name another folder`)
-  const unit = unitFor(deps.platform, { userHome: deps.userHome, crew, handle: me.handle ?? me.id, home, bun: deps.bunPath, plugin })!
+  const unit = unitFor(deps.platform, { userHome: deps.userHome, crew, handle: homeHandle, home, bun: deps.bunPath, plugin })!
   mkdirSync(config.cwd, { recursive: true })
   // Every check has passed: now the files, the key before the unit, so a service never starts without one (§ 9).
   const dir = join(home, LAUNCHER)
@@ -532,6 +569,13 @@ async function install(o: Opts, deps: LaunchDeps) {
   if (before.stoppedReason === 'agent-removed') {
     const { stoppedReason: _gone, ...rest } = before
     writeStateFile(dir, { ...rest, stopped: false })
+  }
+  // The handle its session is named by, as cmdr names the agent now (0.2.24, 0.2.25): the restart below starts it so.
+  const handleNow = me.handle && HANDLE.test(me.handle) ? me.handle : null
+  if (handleNow && handleNow !== homeHandle) writeStateFile(dir, { ...readStateFile(dir), handle: handleNow })
+  else if (readStateFile(dir).handle) {
+    const { handle: _old, ...rest } = readStateFile(dir)
+    writeStateFile(dir, rest)
   }
   // The wrapper before the unit that runs it (0.2.17, 0.2.22).
   mkdirSync(join(home, 'bin'), { recursive: true })
@@ -562,7 +606,7 @@ async function install(o: Opts, deps: LaunchDeps) {
     const p = await deps.run(s, SERVICE_TIMEOUT_MS)
     if (p.code !== 0) refuse('service-failed', firstLine(p))
   }
-  deps.out(`launcher installed for @${me.handle} in ${home}`)
+  deps.out(`launcher installed for @${me.handle}${ours[0] && homeHandle !== me.handle ? ` (its existing launcher, set up as @${homeHandle})` : ''} in ${home}`)
   deps.out(`service: ${unit.label} (${unit.path})`)
   if (deps.platform === 'linux') {
     const user = deps.env.USER ?? ''
@@ -678,7 +722,8 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
   const now = deps.now ?? Date.now
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
   const event = eventTo(deps, dir, now)
-  const name = sessionName(config.crew, config.handle)
+  // `let`: a rename moves the session to its new name (0.2.25), and every later tick looks for it there.
+  let name = sessionOf(config, readStateFile(dir))
   try {
     const client = McClient.create({ apiUrl: config.apiUrl, key, timeoutMs: CLI_TIMEOUT_MS, fetch: deps.fetch })
     event('launcher.started')
@@ -698,6 +743,8 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
     let stretch: string | null = null // the last logged skip, so a stretch logs once (plan § 4, PN-1)
     const asked = { waiting: false } // this session's unknown question, logged once (design 0.2.15)
     let refusedUntil = 0 // a refused key: /agent/me again only after REFUSED_RETRY_MS (AC-7)
+    let sinceMe = HANDLE_POLL_TICKS // ticks with the session up since the last poll: the first tick polls (0.2.26)
+    let refusedUp = false // a generic 401 while the session is up, logged once until a poll answers (AC-40 b)
 
     // The mark is `stop`'s and `start`'s to write, never the daemon's (design § 3.3). A tick holds the state it read
     // at its top across awaits (tmux, cmdr.mc, a spawn's five seconds), and wrote that whole object back: a `launch
@@ -730,11 +777,57 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
       // A session up but not yet heard from since it started (one adopted at a daemon start, or a question that came
       // late) gets one look per tick.
       if (up && !st.stopped && !heardSince(home, st.lastStartAt)) await answerPrompts(deps, config, name, event, 0, now, sleep, asked)
+      // The session up: /agent/me on the first tick and every HANDLE_POLL_TICKS-th after (design 0.2.26 § 3.3 step 1),
+      // for a rename (the session follows it) or a removal (the session ends); on other ticks nothing is asked.
+      if (up && !st.stopped) {
+        if (sinceMe < HANDLE_POLL_TICKS) {
+          sinceMe++
+        } else {
+          sinceMe = 1
+          let me: { handle?: string | null } | null = null
+          try {
+            me = (await retrying(deps, () => client.me())) as unknown as { handle?: string | null }
+            refusedUp = false
+          } catch (e) {
+            const code = statusOf(e)
+            if (code === 401 || code === 403) {
+              if (isAgentRemoved(e)) {
+                // Removed while running (remove/rename AC-4, launcher AC-40 a): the mark, said once, and the session
+                // ends: its key is revoked and it hears nothing. The daemon stays up, idle, asking nothing more.
+                writeStateFile(dir, { ...readStateFile(dir), stopped: true, stoppedReason: 'agent-removed' })
+                event('launcher.refused', { reason: 'agent-removed' })
+                stretch = 'launcher.refused:agent-removed'
+                await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+                event('launch.session.ended', { reason: 'stopped' })
+                save(ended(readStateFile(dir), now(), 'stopped'))
+                wasUp = false
+                return
+              }
+              // Any other refusal leaves the session running (a re-paste restarts it anyway): said once (AC-40 b).
+              if (!refusedUp) event('launcher.refused', { reason: 'unauthorized' })
+              refusedUp = true
+            }
+            // A network failure or a 5xx after the one retry: nothing changes; the next poll asks again (AC-40 c).
+          }
+          const handle = me?.handle ?? null
+          if (handle && HANDLE.test(handle) && sessionName(config.crew, handle) !== name) {
+            // Renamed in cmdr (0.2.25, AC-39): the running session takes the new name, and keeps running.
+            const to = sessionName(config.crew, handle)
+            const r = await deps.run([...tmuxOn(config.tmux), 'rename-session', '-t', `=${name}`, to], TMUX_TIMEOUT_MS)
+            if (r.code === 0) {
+              save({ ...readStateFile(dir), handle })
+              name = to
+              event('launcher.session-renamed')
+            }
+          }
+        }
+      }
       let authorized = true
       let otherLive = false
       if (!up && !st.stopped) {
         if (now() < refusedUntil) authorized = false
         else {
+          sinceMe = 1 // asked now: a session it starts is next polled HANDLE_POLL_TICKS ticks on
           try {
             const me = (await retrying(deps, () => client.me())) as unknown as MeSessions
             otherLive = Array.isArray(me.sessions) && me.sessions.length > 0
@@ -819,11 +912,12 @@ async function status(o: Opts, deps: LaunchDeps) {
   const home = homeOf(deps, o.opt.home)
   const { dir, config } = installed(home)
   const unit = unitOf(deps, home)
-  const name = sessionName(config.crew, config.handle)
+  const st = readStateFile(dir)
+  // The session that exists (the recorded handle), never /agent/me's: right inside a rename's ≤ 5 minutes (0.2.26).
+  const name = sessionOf(config, st)
   deps.out(`service: ${await serviceState(deps, unit)}${unit ? ` (${unit.label})` : ''}`)
   const now_ = installedPlugin(readText(pluginsFile(deps)))
   deps.out(`plugin: ${now_ ?? config.plugin}${now_ || existsSync(join(config.plugin, 'cli', 'cmdr-agent.ts')) ? '' : ' (plugin-missing: set the agent up again)'}`)
-  const st = readStateFile(dir)
   const up = await hasSession(deps, config.tmux, name)
   const now = (deps.now ?? Date.now)()
   const last = readEvents(dir).reverse().find((l) => / launch\.session\.(started|skipped|ended|failed)\b/.test(l)) ?? ''
@@ -850,6 +944,8 @@ async function status(o: Opts, deps: LaunchDeps) {
     deps.out(`activity: ${!a ? 'starting' : a.state === 'idle' ? `idle since ${a.since}` : 'working'}`)
   }
   deps.out(`attach: ${attachLine(config.tmux, name)}`)
+  // The handle cmdr knows it by, beside the home named by the one it was set up with (0.2.24).
+  deps.out(`agent: @${st.handle ?? config.handle} (${home})`)
 }
 const readEvents = (dir: string): string[] => {
   try {
@@ -873,15 +969,15 @@ function mark(o: Opts, deps: LaunchDeps, stopped: boolean): { dir: string; confi
 }
 
 async function stop(o: Opts, deps: LaunchDeps) {
-  const { config } = mark(o, deps, true) // the mark first, so the tick that sees the end reads `stopped`
-  const name = sessionName(config.crew, config.handle)
+  const { dir, config } = mark(o, deps, true) // the mark first, so the tick that sees the end reads `stopped`
+  const name = sessionOf(config, readStateFile(dir))
   await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
   deps.out(`stopped: ${name} (it stays stopped until ${wrapperOf(homeOf(deps, o.opt.home))} launch start --home ${homeOf(deps, o.opt.home)})`)
 }
 
 function start(o: Opts, deps: LaunchDeps) {
-  const { config } = mark(o, deps, false)
-  deps.out(`started: the next tick starts ${sessionName(config.crew, config.handle)}`)
+  const { dir, config } = mark(o, deps, false)
+  deps.out(`started: the next tick starts ${sessionOf(config, readStateFile(dir))}`)
 }
 
 /** `launch set-cwd <dir>` (launcher design 0.2.18, AC-35): move the agent to a folder that exists, then restart the

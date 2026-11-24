@@ -1,6 +1,6 @@
 {
   "name": "cmdr",
   "description": "cmdr channel for Claude Code: the agent's conversations on cmdr's own surface (cmdr.mc), live, with a reply tool. The native counterpart of the Slack channel.",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "keywords": ["cmdr", "messaging", "channel", "mcp"]
 }
