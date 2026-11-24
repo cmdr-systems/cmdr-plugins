@@ -436,10 +436,11 @@ async function install(o: Opts, deps: LaunchDeps) {
     plugin,
     path: (parts.includes(bunDir) ? parts : [bunDir, ...parts]).join(':'),
     // Never the home folder (design 0.2.11, R-8): Claude Code keeps no trust for it, so every unattended start there
-    // stalls at its prompt. Default: a folder of the agent's own, made here.
-    cwd: (o.opt.cwd ?? join(deps.userHome, 'cmdr', me.handle ?? me.id)).replace(/^~(?=\/|$)/, deps.userHome).replace(/\/+$/, '') || '/',
+    // stalls at its prompt. Default: a folder of the agent's own, made here, by crew and handle so two crews' agents of
+    // one handle never share one (launcher design 0.2.13, LS-27).
+    cwd: (o.opt.cwd ?? join(deps.userHome, 'cmdr', crew, me.handle ?? me.id)).replace(/^~(?=\/|$)/, deps.userHome).replace(/\/+$/, '') || '/',
   }
-  if (config.cwd === deps.userHome.replace(/\/+$/, '')) refuse('cwd-is-home', `the agent can't work in your home folder: Claude Code never keeps trust for it. Leave --cwd out (it uses ~/cmdr/${config.handle}) or name another folder`)
+  if (config.cwd === deps.userHome.replace(/\/+$/, '')) refuse('cwd-is-home', `the agent can't work in your home folder: Claude Code never keeps trust for it. Leave --cwd out (it uses ~/cmdr/${config.crew}/${config.handle}) or name another folder`)
   const unit = unitFor(deps.platform, { userHome: deps.userHome, crew, handle: me.handle ?? me.id, home, bun: deps.bunPath, plugin })!
   mkdirSync(config.cwd, { recursive: true })
   // Every check has passed: now the files, the key before the unit, so a service never starts without one (§ 9).
