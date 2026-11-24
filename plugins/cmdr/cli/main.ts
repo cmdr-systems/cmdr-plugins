@@ -45,11 +45,14 @@ export const USAGE = `usage: cmdr-agent <verb> [args]
                                        print each message for you as a <channel …> line, until interrupted; it
                                        declares its scope first (main unless told), as a session does
   sessions                             your live sessions: scope, channel, since
+  launch install|run|status|stop|start|uninstall …
+                                       the session launcher: a login service that keeps one session of yours
+                                       running, until you stop it (cmdr-agent launch --help)
 
-env: CMDR_API_URL, CMDR_AGENT_KEY (every verb); CMDR_STATE_DIR (link, unlink: a live session's directory); CMDR_APP_URL (links, optional)
+env: CMDR_API_URL, CMDR_AGENT_KEY (every verb but launch, whose own --help says); CMDR_STATE_DIR (link, unlink: a live session's directory); CMDR_APP_URL (links, optional)
 A refusal is one line on stderr, "refused: <reason>", and exit 1.`
 
-export const VERBS = ['me', 'conversations', 'history', 'reply', 'react', 'search', 'tasks', 'task', 'offers', 'respond', 'waiting', 'link', 'unlink', 'listen', 'sessions'] as const
+export const VERBS = ['me', 'conversations', 'history', 'reply', 'react', 'search', 'tasks', 'task', 'offers', 'respond', 'waiting', 'link', 'unlink', 'listen', 'sessions', 'launch'] as const
 export type Verb = (typeof VERBS)[number]
 
 /** The socket the listen verb needs: socket.io's, or a test's. */
@@ -69,6 +72,8 @@ export type CliDeps = {
   probeStateDir?: (dir: string) => Promise<boolean>
   /** How long listen waits for cmdr.mc to answer its declaration (agent-client's SESSION_DECLARE_TIMEOUT_MS by default). */
   declareTimeoutMs?: number
+  /** launch's edges, over the real ones (tests: a fake tmux, a fake service manager, a fake socket). */
+  launch?: Partial<import('./launch.js').LaunchDeps>
 }
 
 /** listen's --scope, read as the closed set (sessions design § 3.5). */
@@ -210,7 +215,13 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
   const event = eventOf(deps.env)
   try {
     if (!(VERBS as readonly string[]).includes(verb)) refuse('usage', `no verb ${verb} (cmdr-agent --help)`)
-    // The key first, for every verb (AC-18), before any argument is read.
+    // launch decides for itself where its key comes from: install from the environment, run, exec and status from the
+    // launcher's home, stop, start and uninstall none (session launcher design 0.2.4 § 3.1, AC-17). Every other verb: below.
+    if (verb === 'launch') {
+      const { launch, realLaunchDeps } = await import('./launch.js')
+      return launch(rest, { ...realLaunchDeps({ env: deps.env, out: deps.out, err: deps.err, fetch: deps.fetch, stop: deps.stop }), ...deps.launch })
+    }
+    // The key first, for every verb but launch (AC-18, narrowed by the session launcher's AC-17), before any argument is read.
     let client: McClient
     try {
       client = McClient.create({ apiUrl: deps.env.CMDR_API_URL ?? '', key: deps.env.CMDR_AGENT_KEY ?? '', timeoutMs: CLI_TIMEOUT_MS, fetch: deps.fetch })
@@ -229,7 +240,7 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
         return f()
       }
     }
-    await verbs[verb as Verb](rest, { client, deps, retrying, event })
+    await verbs[verb as Exclude<Verb, 'launch'>](rest, { client, deps, retrying, event })
     return 0
   } catch (e) {
     const line = e instanceof Refusal ? e.message : statusOf(e) !== null ? `server-refused: ${(e as Error).message}` : `unreachable: ${(e as Error)?.message ?? String(e)}`
@@ -256,7 +267,7 @@ const meOf = async (ctx: Ctx): Promise<Me> => {
   return typeof mode === 'string' ? me : refuse(mode.refused)
 }
 
-const verbs: Record<Verb, (a: string[], ctx: Ctx) => Promise<void>> = {
+const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<void>> = {
   async me(_a, ctx) {
     ctx.deps.out(JSON.stringify(await meOf(ctx), null, 2))
   },
