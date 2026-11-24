@@ -70,7 +70,7 @@ export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -102,6 +102,45 @@ export function tmuxVersionOk(v: string): boolean {
 /** The agent's one tmux session (design 0.2.4 § 3.3): `cmdr_<crew>_<handle>`. `_` is in neither a crew key nor a
  *  handle (`^[a-z0-9-]{1,40}$`), so two agents never share a name, even two crews' `scout` on one machine. */
 export const sessionName = (crew: string, handle: string): string => `cmdr_${crew}_${handle}`
+
+/** The launcher's own tmux server (design 0.2.22): every tmux call and printed attach line uses `-L cmdr`, so it never
+ *  meets the person's own tmux, of another version. */
+export const TMUX_SOCKET = 'cmdr'
+export const tmuxOn = (tmux: string): string[] => [tmux, '-L', TMUX_SOCKET]
+/** How to watch the session, as printed. */
+export const attachLine = (tmux: string, name: string): string => `${tmux} -L ${TMUX_SOCKET} attach -t ${name}`
+/** The daemon's exit when a newer plugin is installed (design 0.2.22/0.2.23, LS-34): `EX_TEMPFAIL`, which macOS's
+ *  KeepAlive and Linux's `Restart=on-failure` both restart, onto the new code. Its session is left running. */
+export const EXIT_UPDATED = 75
+/** The wrapper in the launcher's home (design 0.2.17): every printed command and the unit run it. */
+export const wrapperOf = (home: string): string => join(home, 'bin', 'cmdr-agent')
+/** The wrapper's text: it finds the cmdr plugin Claude Code has installed now, at each run, and runs its CLI with the
+ *  bun the launcher was installed with. A plugin update (a new versioned `installPath`) is picked up by the next run. */
+export function wrapperScript(bun: string): string {
+  const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`
+  return `#!/bin/sh
+# cmdr-agent: the cmdr plugin's CLI, from whichever version Claude Code has installed now (launcher design 0.2.17).
+# Written by \`cmdr-agent launch install\`; safe to delete with the launcher (\`launch uninstall\`).
+BUN=${q(bun)}
+P=$("$BUN" -e 'const d = process.env.CLAUDE_CONFIG_DIR || process.env.HOME + "/.claude"; const j = await Bun.file(d + "/plugins/installed_plugins.json").json(); console.log(j.plugins["cmdr@cmdr-crew"][0].installPath)' 2>/dev/null)
+if [ -z "$P" ] || [ ! -f "$P/cli/cmdr-agent.ts" ]; then
+  echo "refused: plugin-missing: Claude Code has no cmdr plugin installed: set the agent up again" >&2
+  exit 69
+fi
+exec "$BUN" "$P/cli/cmdr-agent.ts" "$@"
+`
+}
+/** The cmdr plugin folder Claude Code has installed now (`installed_plugins.json`), or null when it can't say. */
+export function installedPlugin(claudeConfig: string | null): string | null {
+  if (!claudeConfig) return null
+  try {
+    const j = JSON.parse(claudeConfig) as { plugins?: Record<string, { installPath?: unknown }[]> }
+    const p = j?.plugins?.['cmdr@cmdr-crew']?.[0]?.installPath
+    return typeof p === 'string' && p.startsWith('/') ? p.replace(/\/+$/, '') : null
+  } catch {
+    return null
+  }
+}
 
 export type TickReason = 'live' | 'backoff' | 'stopped' | 'unauthorized'
 export type TickVerdict = { action: 'none' } | { action: 'start' } | { action: 'skip'; reason: TickReason }
@@ -195,10 +234,11 @@ const sd = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').repl
  *  unit (Restart=on-failure, WantedBy=default.target). Its bytes are a function of the paths alone, so a re-install
  *  with the same inputs writes the same file. Any other platform: null (`platform-unsupported`). */
 export function unitFor(platform: string, p: UnitPaths): { path: string; label: string; contents: string } | null {
-  const entry = `${p.plugin}/cli/cmdr-agent.ts`
+  // The wrapper, never a versioned plugin path (design 0.2.22): each start runs the plugin installed now.
+  const run = [wrapperOf(p.home), 'launch', 'run', '--home', p.home]
   if (platform === 'darwin') {
     const label = `it.cmdr.agent.${p.crew}.${p.handle}`
-    const args = [p.bun, entry, 'launch', 'run', '--home', p.home].map((a) => `    <string>${xml(a)}</string>`).join('\n')
+    const args = run.map((a) => `    <string>${xml(a)}</string>`).join('\n')
     return {
       path: `${p.userHome}/Library/LaunchAgents/${label}.plist`,
       label,
@@ -232,7 +272,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${[p.bun, entry, 'launch', 'run', '--home', p.home].map(sd).join(' ')}
+ExecStart=${run.map(sd).join(' ')}
 Restart=on-failure
 RestartSec=5
 
@@ -333,7 +373,7 @@ function installed(home: string): { dir: string; key: string; config: LaunchConf
     // below
   }
   const config = readJson<LaunchConfig>(join(dir, CONFIG_FILE))
-  if (!key || !config) refuse('launcher-not-installed', `no launcher in ${home}: run cmdr-agent launch install`)
+  if (!key || !config) refuse('launcher-not-installed', `no launcher in ${home}: set the agent up on this machine again (Set up on this Mac, or its connect snippet)`)
   return { dir, key, config: config! }
 }
 
@@ -348,7 +388,7 @@ function homeOf(deps: LaunchDeps, given: string | undefined): string {
     // none
   }
   if (found.length === 1) return found[0]!
-  return refuse(found.length ? 'usage' : 'launcher-not-installed', found.length ? `more than one launcher home: pass --home (${found.join(', ')})` : 'no launcher installed: run cmdr-agent launch install')
+  return refuse(found.length ? 'usage' : 'launcher-not-installed', found.length ? `more than one launcher home: pass --home (${found.join(', ')})` : 'no launcher installed: set the agent up on this machine (Set up on this Mac, or its connect snippet)')
 }
 
 /** The unit this home's launcher runs as: found by its own contents (`--home <home>`), so stop, status and uninstall
@@ -384,12 +424,12 @@ async function serviceState(deps: LaunchDeps, unit: { label: string } | null): P
 
 /** The tmux sessions alive now (one `list-sessions`; no server is none). */
 async function liveTmux(deps: LaunchDeps, tmux: string): Promise<Set<string>> {
-  const p = await deps.run([tmux, 'list-sessions', '-F', '#{session_name}'], TMUX_TIMEOUT_MS)
+  const p = await deps.run([...tmuxOn(tmux), 'list-sessions', '-F', '#{session_name}'], TMUX_TIMEOUT_MS)
   return p.code === 0 ? new Set(p.stdout.split('\n').map((l) => l.trim()).filter(Boolean)) : new Set()
 }
 /** Whether our tmux session exists (`has-session -t`; a missing server is "no"). */
 async function hasSession(deps: LaunchDeps, tmux: string, name: string): Promise<boolean> {
-  return (await deps.run([tmux, 'has-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)).code === 0
+  return (await deps.run([...tmuxOn(tmux), 'has-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)).code === 0
 }
 /** `state.json`, or a fresh state when absent or unreadable (its fields checked one by one). */
 const readStateFile = (dir: string): LaunchState => {
@@ -438,7 +478,10 @@ async function install(o: Opts, deps: LaunchDeps) {
   if (typeof mode === 'object') refuse('platform-agent', 'a doc agent runs on cmdr itself and starts no sessions')
   if (mode !== 'external') refuse('not-external', 'Only a local agent runs a launcher.')
   const path = deps.env.PATH ?? ''
-  const tmux = deps.which('tmux', path)
+  // The desktop app's own tmux (design 0.2.22, `~/.cmdr/bin/tmux`) when it passes one; else the one on PATH.
+  const given = o.opt.tmux?.replace(/^~(?=\/|$)/, deps.userHome)
+  if (given && !(given.startsWith('/') && existsSync(given))) refuse('tmux-required', `no tmux at ${given}`)
+  const tmux = given ?? deps.which('tmux', path)
   const getTmux = deps.platform === 'darwin' ? 'brew install tmux' : 'install tmux with your package manager (e.g. sudo apt install tmux)'
   if (!tmux) refuse('tmux-required', `no tmux on PATH: ${getTmux}`)
   const v = await deps.run([tmux!, '-V'], TMUX_TIMEOUT_MS)
@@ -490,6 +533,10 @@ async function install(o: Opts, deps: LaunchDeps) {
     const { stoppedReason: _gone, ...rest } = before
     writeStateFile(dir, { ...rest, stopped: false })
   }
+  // The wrapper before the unit that runs it (0.2.17, 0.2.22).
+  mkdirSync(join(home, 'bin'), { recursive: true })
+  writeWhole(wrapperOf(home), wrapperScript(deps.bunPath), 0o755)
+  chmodSync(wrapperOf(home), 0o755)
   mkdirSync(dirname(unit.path), { recursive: true })
   writeWhole(unit.path, unit.contents, 0o644)
   // The service manager last (AC-20): a refusal here leaves the files, and a re-run converges.
@@ -522,7 +569,7 @@ async function install(o: Opts, deps: LaunchDeps) {
     const linger = user ? await deps.run(['loginctl', 'show-user', user, '-p', 'Linger'], SERVICE_TIMEOUT_MS) : null
     if (linger && linger.code === 0 && linger.stdout.trim() === 'Linger=no') deps.out(`it stops when you log out; to keep it running: loginctl enable-linger ${user}`)
   }
-  deps.out(`status: cmdr-agent launch status --home ${home}`)
+  deps.out(`status: ${wrapperOf(home)} launch status --home ${home}`)
 }
 
 /** A read once more after 1 s on network trouble or a 5xx (the CLI's rule). */
@@ -563,6 +610,21 @@ function exec(o: Opts, deps: LaunchDeps) {
 
 // ── run (the daemon) ──
 
+/** What runs the CLI inside the session: the wrapper when installed (0.2.17), so a session started after a plugin
+ *  update runs the new plugin; a home from before it, its recorded plugin. */
+const execVia = (config: LaunchConfig, home: string): string[] =>
+  existsSync(wrapperOf(home)) ? [wrapperOf(home)] : [config.bun, join(config.plugin, 'cli', 'cmdr-agent.ts')]
+/** `installed_plugins.json`, where Claude Code keeps it (inside `CLAUDE_CONFIG_DIR` when set). */
+const pluginsFile = (deps: LaunchDeps): string =>
+  join(deps.env.CLAUDE_CONFIG_DIR?.trim() || join(deps.userHome, '.claude'), 'plugins', 'installed_plugins.json')
+const readText = (p: string): string | null => {
+  try {
+    return readFileSync(p, 'utf8')
+  } catch {
+    return null
+  }
+}
+
 /** The agent's folder as the screen may spell it (design 0.2.21, LS-33): as configured, as the system resolves it, and
  *  each with the home folder written `~`. */
 export const foldersOf = (cwd: string, userHome: string): string[] => {
@@ -589,10 +651,10 @@ async function answerPrompts(deps: LaunchDeps, config: LaunchConfig, name: strin
   // Bounded by looks as well as by the clock, so a clock that doesn't move (or jumps back) can't hold the tick forever.
   for (let looks = Math.floor(windowMs / PROMPT_POLL_MS); ; looks--) {
     if (!(await hasSession(deps, config.tmux, name))) return
-    const cap = await deps.run([config.tmux, 'capture-pane', '-p', '-t', target], TMUX_TIMEOUT_MS)
+    const cap = await deps.run([...tmuxOn(config.tmux), 'capture-pane', '-p', '-t', target], TMUX_TIMEOUT_MS)
     const a = cap.code === 0 ? answerFor(cap.stdout, folders) : null
     if (a) {
-      await deps.run([config.tmux, 'send-keys', '-t', target, ...a.keys], TMUX_TIMEOUT_MS)
+      await deps.run([...tmuxOn(config.tmux), 'send-keys', '-t', target, ...a.keys], TMUX_TIMEOUT_MS)
       keys += a.keys.length
       if (a.keys.includes('Enter')) event('launch.session.prompt-answered', { arm: a.arm })
       if (a.arm === 'dev-channels') return
@@ -608,7 +670,7 @@ async function answerPrompts(deps: LaunchDeps, config: LaunchConfig, name: strin
 /** Whether `/agent/me` lists a live session: any entry in its `sessions` (design § 3.3 step 2). */
 type MeSessions = { sessions?: unknown[] }
 
-async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
+async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
   const home = homeOf(deps, o.opt.home)
   const { dir, key, config } = installed(home)
   const lock = (deps.lock ?? flockExclusive)(join(dir, LOCK_FILE))
@@ -620,7 +682,19 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
   try {
     const client = McClient.create({ apiUrl: config.apiUrl, key, timeoutMs: CLI_TIMEOUT_MS, fetch: deps.fetch })
     event('launcher.started')
+    // A session of this agent on the default tmux socket (a launcher from before 0.2.22) is ended once, there only,
+    // and the tick starts it again on `-L cmdr`: otherwise the agent would run twice (design 0.2.22, AC-37).
+    if ((await deps.run([config.tmux, 'has-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)).code === 0) {
+      await deps.run([config.tmux, 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+      event('launcher.session-moved')
+    }
     let wasUp = await hasSession(deps, config.tmux, name) // a session left by a hard-killed daemon is adopted (§ 5)
+    // A newer plugin installed (design 0.2.22/0.2.23): this daemon leaves for the unit to start the new code, and its
+    // session keeps running. Only when the unit runs the wrapper, which is what makes the restart reach the new code.
+    const runningFrom = deps.pluginDir.replace(/\/+$/, '')
+    let updated = false
+    let leave: () => void = () => {}
+    const left = new Promise<void>((r) => (leave = r))
     let stretch: string | null = null // the last logged skip, so a stretch logs once (plan § 4, PN-1)
     const asked = { waiting: false } // this session's unknown question, logged once (design 0.2.15)
     let refusedUntil = 0 // a refused key: /agent/me again only after REFUSED_RETRY_MS (AC-7)
@@ -636,6 +710,14 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
     }
 
     const once = async () => {
+      if (updated) return
+      const installedNow = installedPlugin(readText(pluginsFile(deps)))
+      if (installedNow && installedNow !== runningFrom && existsSync(join(installedNow, 'cli', 'cmdr-agent.ts')) && existsSync(wrapperOf(home))) {
+        updated = true
+        event('launcher.updated')
+        leave()
+        return
+      }
       let st = readStateFile(dir)
       const up = await hasSession(deps, config.tmux, name)
       if (wasUp && !up) {
@@ -681,7 +763,7 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
       }
       if (v.action !== 'start') return
       st = { ...st, lastStartAt: new Date(now()).toISOString() }
-      const spawned = await deps.run([config.tmux, 'new-session', '-d', '-s', name, '-c', config.cwd, '--', config.bun, join(config.plugin, 'cli', 'cmdr-agent.ts'), 'launch', 'exec', '--home', home], TMUX_TIMEOUT_MS)
+      const spawned = await deps.run([...tmuxOn(config.tmux), 'new-session', '-d', '-s', name, '-c', config.cwd, '--', ...execVia(config, home), 'launch', 'exec', '--home', home], TMUX_TIMEOUT_MS)
       let alive = spawned.code === 0
       for (const end = now() + SPAWN_DEADLINE_MS; alive && !(await hasSession(deps, config.tmux, name)) && now() < end; ) await sleep(250)
       alive = alive && (await hasSession(deps, config.tmux, name))
@@ -704,7 +786,7 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
       if (!st.stopped) await answerPrompts(deps, config, name, event, PROMPT_WATCH_MS, now, sleep, asked)
       // The stop came while the session was still coming up, so stop's own kill found nothing to end: end it here.
       // The next tick sees it gone and logs the stopped end.
-      if (st.stopped) await deps.run([config.tmux, 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+      if (st.stopped) await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
     }
 
     let lane: Promise<unknown> = Promise.resolve()
@@ -717,12 +799,15 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
       const t = setInterval(fn, ms)
       return () => clearInterval(t)
     }))(TICK_MS, () => void inLane(once))
-    await new Promise<void>((r) => (deps.stop?.aborted ? r() : deps.stop?.addEventListener('abort', () => r(), { once: true })))
+    await Promise.race([left, new Promise<void>((r) => (deps.stop?.aborted ? r() : deps.stop?.addEventListener('abort', () => r(), { once: true })))])
     stopTick()
     await lane
+    // Leaving for an update: the session stays up for the new daemon to adopt (step 1); the unit restarts on 75.
+    if (updated) return EXIT_UPDATED
     // The session dies with its supervisor (design § 3.3, AC-27).
-    await deps.run([config.tmux, 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+    await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
     event('launcher.stopped')
+    return 0
   } finally {
     lock!.release()
   }
@@ -736,23 +821,24 @@ async function status(o: Opts, deps: LaunchDeps) {
   const unit = unitOf(deps, home)
   const name = sessionName(config.crew, config.handle)
   deps.out(`service: ${await serviceState(deps, unit)}${unit ? ` (${unit.label})` : ''}`)
-  deps.out(`plugin: ${config.plugin}${existsSync(join(config.plugin, 'cli', 'cmdr-agent.ts')) ? '' : ' (plugin-moved: run cmdr-agent launch install again)'}`)
+  const now_ = installedPlugin(readText(pluginsFile(deps)))
+  deps.out(`plugin: ${now_ ?? config.plugin}${now_ || existsSync(join(config.plugin, 'cli', 'cmdr-agent.ts')) ? '' : ' (plugin-missing: set the agent up again)'}`)
   const st = readStateFile(dir)
   const up = await hasSession(deps, config.tmux, name)
   const now = (deps.now ?? Date.now)()
   const last = readEvents(dir).reverse().find((l) => / launch\.session\.(started|skipped|ended|failed)\b/.test(l)) ?? ''
-  const screen = up && !heardSince(home, st.lastStartAt) ? await deps.run([config.tmux, 'capture-pane', '-p', '-t', `=${name}:`], TMUX_TIMEOUT_MS) : null
+  const screen = up && !heardSince(home, st.lastStartAt) ? await deps.run([...tmuxOn(config.tmux), 'capture-pane', '-p', '-t', `=${name}:`], TMUX_TIMEOUT_MS) : null
   const asking = screen && screen.code === 0 && screen.stdout.replace(/\s+/g, '').includes('Entertoconfirm')
   const session = up
     ? asking
       ? answerFor(screen.stdout, foldersOf(config.cwd, deps.userHome))
         ? `starting: answering Claude Code's start question (since ${st.lastStartAt ?? 'unknown'})`
-        : `waiting on a question in its session the launcher doesn't answer: tmux attach -t ${name}`
+        : `waiting on a question in its session the launcher doesn't answer: ${attachLine(config.tmux, name)}`
       : `running since ${st.lastStartAt ?? 'unknown'}`
     : st.stopped && st.stoppedReason === 'agent-removed'
-      ? 'removed from its crew: its key no longer works (launch uninstall takes it off this machine)'
+      ? `removed from its crew: its key no longer works (${wrapperOf(home)} launch uninstall --home ${home} takes it off this machine)`
       : st.stopped
-      ? 'stopped (launch start to resume)'
+      ? `stopped (${wrapperOf(home)} launch start --home ${home} to resume)`
       : st.backoffUntil && Date.parse(st.backoffUntil) > now
         ? `backoff until ${st.backoffUntil}`
         : / launch\.session\.skipped reason=live\b/.test(last)
@@ -763,7 +849,7 @@ async function status(o: Opts, deps: LaunchDeps) {
     const a = readActivity(home)
     deps.out(`activity: ${!a ? 'starting' : a.state === 'idle' ? `idle since ${a.since}` : 'working'}`)
   }
-  deps.out(`attach: tmux attach -t ${name}`)
+  deps.out(`attach: ${attachLine(config.tmux, name)}`)
 }
 const readEvents = (dir: string): string[] => {
   try {
@@ -789,8 +875,8 @@ function mark(o: Opts, deps: LaunchDeps, stopped: boolean): { dir: string; confi
 async function stop(o: Opts, deps: LaunchDeps) {
   const { config } = mark(o, deps, true) // the mark first, so the tick that sees the end reads `stopped`
   const name = sessionName(config.crew, config.handle)
-  await deps.run([config.tmux, 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
-  deps.out(`stopped: ${name} (it stays stopped until cmdr-agent launch start)`)
+  await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+  deps.out(`stopped: ${name} (it stays stopped until ${wrapperOf(homeOf(deps, o.opt.home))} launch start --home ${homeOf(deps, o.opt.home)})`)
 }
 
 function start(o: Opts, deps: LaunchDeps) {
@@ -846,7 +932,7 @@ async function uninstall(o: Opts, deps: LaunchDeps) {
 
 export const LAUNCH_USAGE = `usage: cmdr-agent launch <install|run|status|stop|start|set-cwd|uninstall> [args]
 
-  install [--home <dir>] [--cwd <dir>] [--plugin <folder>]
+  install [--home <dir>] [--cwd <dir>] [--plugin <folder>] [--tmux <path>]
                                        keep the key here and start the launcher as a login service
   run [--home <dir>]                   the launcher itself (the service runs it): keeps the agent's one session running
   status [--home <dir>]                the service, the session, and how to attach to it
@@ -885,10 +971,10 @@ export function realLaunchDeps(base: Pick<LaunchDeps, 'env' | 'out' | 'err' | 'f
 export async function launch(argv: string[], deps: LaunchDeps): Promise<number> {
   const [sub, ...rest] = argv
   try {
-    const flags = ['home', 'cwd', 'plugin']
+    const flags = ['home', 'cwd', 'plugin', 'tmux']
     const o = parseArgs(rest, flags, ['all'])
     if (sub === 'install') await install(o, deps)
-    else if (sub === 'run') await daemon(o, deps)
+    else if (sub === 'run') return await daemon(o, deps)
     else if (sub === 'exec') exec(o, deps)
     else if (sub === 'status') await status(o, deps)
     else if (sub === 'stop') await stop(o, deps)
