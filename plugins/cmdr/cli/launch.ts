@@ -67,7 +67,7 @@ export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.trust-needed'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -100,16 +100,18 @@ export function tmuxVersionOk(v: string): boolean {
  *  handle (`^[a-z0-9-]{1,40}$`), so two agents never share a name, even two crews' `scout` on one machine. */
 export const sessionName = (crew: string, handle: string): string => `cmdr_${crew}_${handle}`
 
-export type TickReason = 'live' | 'backoff' | 'stopped' | 'unauthorized'
+export type TickReason = 'live' | 'backoff' | 'stopped' | 'unauthorized' | 'trust-needed'
 export type TickVerdict = { action: 'none' } | { action: 'start' } | { action: 'skip'; reason: TickReason }
 
 /** One tick's decision (design § 3.3; plan 0.2.2 § 4), first match wins. `tmuxLive`: our `cmdr_<crew>_<handle>` exists.
  *  `authorized`: `/agent/me` answered (false on 401/403). `otherLive`: it listed a live session of the agent (read
  *  only when our tmux session is absent, so any listed session is not ours). `stopped` is checked before the network
  *  answers matter, and `unauthorized` before `live` (a 401 has no sessions to read). */
-export function tick(s: LaunchState, tmuxLive: boolean, otherLive: boolean, authorized: boolean, now: number): TickVerdict {
+export function tick(s: LaunchState, tmuxLive: boolean, otherLive: boolean, authorized: boolean, now: number, trusted = true): TickVerdict {
   if (tmuxLive) return { action: 'none' }
   if (s.stopped) return { action: 'skip', reason: 'stopped' }
+  // Step 3a (design 0.2.11): Claude Code would stop at its workspace-trust prompt, unattended, and look healthy.
+  if (!trusted) return { action: 'skip', reason: 'trust-needed' }
   if (!authorized) return { action: 'skip', reason: 'unauthorized' }
   if (otherLive) return { action: 'skip', reason: 'live' }
   if (s.backoffUntil && Date.parse(s.backoffUntil) > now) return { action: 'skip', reason: 'backoff' }
@@ -134,8 +136,31 @@ export function ended(s: LaunchState, now: number, reason: 'exited' | 'stopped' 
 export function eventOfVerdict(v: TickVerdict): { tag: LaunchEvent; fields: Record<string, string> } | null {
   if (v.action !== 'skip') return null
   if (v.reason === 'unauthorized') return { tag: 'launcher.refused', fields: { reason: 'unauthorized' } }
+  if (v.reason === 'trust-needed') return { tag: 'launch.session.trust-needed', fields: {} }
   return { tag: 'launch.session.skipped', fields: { reason: v.reason } }
 }
+
+/** Where Claude Code keeps its per-folder state, `~/.claude.json` (inside `CLAUDE_CONFIG_DIR` when that is set). */
+export const claudeStatePath = (env: Record<string, string | undefined>, userHome: string): string =>
+  env.CLAUDE_CONFIG_DIR?.trim() ? join(env.CLAUDE_CONFIG_DIR.trim(), '.claude.json') : join(userHome, '.claude.json')
+
+/** Whether Claude Code trusts a folder (design 0.2.11, step 3a): `projects[<folder>].hasTrustDialogAccepted === true`.
+ *  Missing, unreadable, unparseable or any other shape: not trusted, never trusted by default (R-13: the file is Claude
+ *  Code's, not a contract, so a moved flag waits loudly rather than starting a session that stalls). Read only: the
+ *  launcher never writes it; the question is the person's, asked by Claude Code once per folder. */
+export function trustedIn(claudeState: string | null, folder: string): boolean {
+  if (!claudeState) return false
+  try {
+    const j = JSON.parse(claudeState) as { projects?: Record<string, { hasTrustDialogAccepted?: unknown }> }
+    const key = folder.replace(/\/+$/, '')
+    return j?.projects?.[key]?.hasTrustDialogAccepted === true
+  } catch {
+    return false
+  }
+}
+
+/** The one step that trusts a folder, as status, the snippet and the card say it. */
+export const trustStep = (folder: string): string => `tmux new -c ${folder} claude (answer Yes, then quit)`
 
 /** What the login service is told to run: paths alone, never the key or any environment (design § 3.1, § 7). */
 export type UnitPaths = { userHome: string; crew: string; handle: string; home: string; bun: string; plugin: string }
@@ -410,9 +435,13 @@ async function install(o: Opts, deps: LaunchDeps) {
     bun: deps.bunPath,
     plugin,
     path: (parts.includes(bunDir) ? parts : [bunDir, ...parts]).join(':'),
-    cwd: (o.opt.cwd ?? deps.userHome).replace(/^~(?=\/|$)/, deps.userHome),
+    // Never the home folder (design 0.2.11, R-8): Claude Code keeps no trust for it, so every unattended start there
+    // stalls at its prompt. Default: a folder of the agent's own, made here.
+    cwd: (o.opt.cwd ?? join(deps.userHome, 'cmdr', me.handle ?? me.id)).replace(/^~(?=\/|$)/, deps.userHome).replace(/\/+$/, '') || '/',
   }
+  if (config.cwd === deps.userHome.replace(/\/+$/, '')) refuse('cwd-is-home', `the agent can't work in your home folder: Claude Code never keeps trust for it. Leave --cwd out (it uses ~/cmdr/${config.handle}) or name another folder`)
   const unit = unitFor(deps.platform, { userHome: deps.userHome, crew, handle: me.handle ?? me.id, home, bun: deps.bunPath, plugin })!
+  mkdirSync(config.cwd, { recursive: true })
   // Every check has passed: now the files, the key before the unit, so a service never starts without one (§ 9).
   const dir = join(home, LAUNCHER)
   mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -547,7 +576,8 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
           }
         }
       }
-      const v = tick(st, up, otherLive, authorized, now())
+      const trusted = up || st.stopped ? true : trustedIn(readOptional(claudeStatePath(deps.env, deps.userHome)), config.cwd)
+      const v = tick(st, up, otherLive, authorized, now(), trusted)
       if (v.action !== 'skip') stretch = null
       const said = eventOfVerdict(v)
       if (said && stretch !== `${said.tag}:${said.fields.reason}`) {
@@ -613,7 +643,7 @@ async function status(o: Opts, deps: LaunchDeps) {
   const st = readStateFile(dir)
   const up = await hasSession(deps, config.tmux, name)
   const now = (deps.now ?? Date.now)()
-  const last = readEvents(dir).reverse().find((l) => / launch\.session\.(started|skipped|ended|failed)\b/.test(l)) ?? ''
+  const last = readEvents(dir).reverse().find((l) => / launch\.session\.(started|skipped|ended|failed|trust-needed)\b/.test(l)) ?? ''
   const session = up
     ? `running since ${st.lastStartAt ?? 'unknown'}`
     : st.stopped
@@ -622,13 +652,22 @@ async function status(o: Opts, deps: LaunchDeps) {
         ? `backoff until ${st.backoffUntil}`
         : / launch\.session\.skipped reason=live\b/.test(last)
           ? 'skipped: another session is live'
-          : 'not running (the next tick starts it)'
+          : !trustedIn(readOptional(claudeStatePath(deps.env, deps.userHome)), config.cwd)
+            ? `waiting for you to trust ${config.cwd} once: run ${trustStep(config.cwd)}`
+            : 'not running (the next tick starts it)'
   deps.out(`session: ${session}`)
   if (up) {
     const a = readActivity(home)
     deps.out(`activity: ${!a ? 'starting' : a.state === 'idle' ? `idle since ${a.since}` : 'working'}`)
   }
   deps.out(`attach: tmux attach -t ${name}`)
+}
+const readOptional = (p: string): string | null => {
+  try {
+    return readFileSync(p, 'utf8')
+  } catch {
+    return null
+  }
 }
 const readEvents = (dir: string): string[] => {
   try {
