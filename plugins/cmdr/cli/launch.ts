@@ -41,6 +41,9 @@ export type LaunchConfig = {
  *  with the backoff ladder's position (written by the daemon's tick only). */
 export type LaunchState = {
   stopped: boolean
+  /** Why it's stopped, when it wasn't a person's `launch stop` (remove/rename design AC-4; connect 0.2.9 reads it as
+   *  `removed`): its agent was removed from its crew. Cleared by `start` and `stop`. */
+  stoppedReason?: 'agent-removed'
   lastStartAt: string | null
   lastEndAt: string | null
   /** 0..2: the index into BACKOFF_STEPS_MS of the next early-exit wait */
@@ -288,6 +291,8 @@ class Refused extends Error {
 const refuse = (reason: string, detail?: string): never => {
   throw new Refused(reason, detail)
 }
+/** cmdr.mc's answer to a removed agent's key: `401 agent-removed: …` (the client's one-line error). */
+const isAgentRemoved = (e: unknown): boolean => /^401 agent-removed:/.test(e instanceof Error ? e.message : '')
 const statusOf = (e: unknown): number | null => {
   const m = /^(\d{3}) /.exec(e instanceof Error ? e.message : '')
   return m ? Number(m[1]) : null
@@ -392,7 +397,7 @@ const readStateFile = (dir: string): LaunchState => {
   if (!j) return { ...FRESH_STATE }
   const iso = (v: unknown) => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? v : null)
   const step = j.backoffStep === 1 || j.backoffStep === 2 ? j.backoffStep : 0
-  return { stopped: j.stopped === true, lastStartAt: iso(j.lastStartAt), lastEndAt: iso(j.lastEndAt), backoffStep: step, backoffUntil: iso(j.backoffUntil) }
+  return { stopped: j.stopped === true, ...(j.stopped === true && j.stoppedReason === 'agent-removed' ? { stoppedReason: 'agent-removed' as const } : {}), lastStartAt: iso(j.lastStartAt), lastEndAt: iso(j.lastEndAt), backoffStep: step, backoffUntil: iso(j.backoffUntil) }
 }
 const writeStateFile = (dir: string, st: LaunchState) => writeWhole(join(dir, STATE_FILE), `${JSON.stringify(st, null, 2)}\n`, 0o600)
 /** The session's `activity.state` (the plugin writes it; the launcher only reads it, for `status`). */
@@ -473,6 +478,13 @@ async function install(o: Opts, deps: LaunchDeps) {
   chmodSync(dir, 0o700)
   writeWhole(join(dir, KEY_FILE), (deps.env.CMDR_AGENT_KEY ?? '').trim(), 0o600)
   writeWhole(join(dir, CONFIG_FILE), `${JSON.stringify(config, null, 2)}\n`, 0o600)
+  // A new key for an agent its crew had removed (re-added, its snippet pasted again): the removal stop is over (remove/
+  // rename RR-3). A person's own `launch stop` is theirs and stays.
+  const before = readStateFile(dir)
+  if (before.stoppedReason === 'agent-removed') {
+    const { stoppedReason: _gone, ...rest } = before
+    writeStateFile(dir, { ...rest, stopped: false })
+  }
   mkdirSync(dirname(unit.path), { recursive: true })
   writeWhole(unit.path, unit.contents, 0o644)
   // The service manager last (AC-20): a refusal here leaves the files, and a re-run converges.
@@ -642,6 +654,14 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<void> {
           } catch (e) {
             const code = statusOf(e)
             if (code !== 401 && code !== 403) throw e
+            // Its agent was removed from its crew (remove/rename design AC-4): no key will work again, so it stops, says
+            // so once, and asks cmdr.mc nothing more. The one write of the mark that is the daemon's own.
+            if (isAgentRemoved(e)) {
+              writeStateFile(dir, { ...readStateFile(dir), stopped: true, stoppedReason: 'agent-removed' })
+              event('launcher.refused', { reason: 'agent-removed' })
+              stretch = 'launcher.refused:agent-removed'
+              return
+            }
             authorized = false
             refusedUntil = now() + REFUSED_RETRY_MS
           }
@@ -724,7 +744,9 @@ async function status(o: Opts, deps: LaunchDeps) {
         ? `starting: answering Claude Code's start question (since ${st.lastStartAt ?? 'unknown'})`
         : `waiting on a question in its session the launcher doesn't answer: tmux attach -t ${name}`
       : `running since ${st.lastStartAt ?? 'unknown'}`
-    : st.stopped
+    : st.stopped && st.stoppedReason === 'agent-removed'
+      ? 'removed from its crew: its key no longer works (launch uninstall takes it off this machine)'
+      : st.stopped
       ? 'stopped (launch start to resume)'
       : st.backoffUntil && Date.parse(st.backoffUntil) > now
         ? `backoff until ${st.backoffUntil}`
@@ -753,7 +775,8 @@ function mark(o: Opts, deps: LaunchDeps, stopped: boolean): { dir: string; confi
   const dir = join(home, LAUNCHER)
   const config = readJson<LaunchConfig>(join(dir, CONFIG_FILE))
   if (!config) refuse('launcher-not-installed', `no launcher in ${home}`)
-  writeStateFile(dir, { ...readStateFile(dir), stopped })
+  const { stoppedReason: _was, ...st } = readStateFile(dir)
+  writeStateFile(dir, { ...st, stopped })
   eventTo(deps, dir, deps.now ?? Date.now)('launcher.marked', {}, stopped ? 'stopped' : 'started')
   return { dir, config: config! }
 }
