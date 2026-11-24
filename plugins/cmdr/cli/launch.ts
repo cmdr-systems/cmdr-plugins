@@ -12,7 +12,7 @@
 // Every edge is injected (LaunchDeps), so the tests drive the core with a fake tmux, a fake service manager and a fake
 // cmdr.mc. This file imports no socket, Session or Hearing code (AC-26 by construction, plan 0.2.2 § 4).
 
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { ACTIVITY_STATE_FILE, McClient, Mode } from '../agent-client/index.js'
@@ -70,7 +70,7 @@ export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -453,6 +453,11 @@ async function install(o: Opts, deps: LaunchDeps) {
   // The session finds bun and claude as this shell did (LS-3, AC-16): its PATH, with bun's folder if absent.
   const bunDir = dirname(deps.bunPath)
   const parts = path.split(':').filter(Boolean)
+  // A re-install (a re-paste, Set up again, a plugin update) keeps the folder this home already works in (launcher
+  // design 0.2.18, AC-35; LOCAL-AGENTS-36): Claude Code keys memory and history by folder, so moving it silently
+  // loses them. Only --cwd changes it; a fresh home gets the default. A kept home folder (from before 0.2.11) is not kept.
+  const kept = readJson<Partial<LaunchConfig>>(join(home, LAUNCHER, CONFIG_FILE))?.cwd
+  const keptCwd = typeof kept === 'string' && kept.startsWith('/') && kept.replace(/\/+$/, '') !== deps.userHome.replace(/\/+$/, '') ? kept : undefined
   const config: LaunchConfig = {
     apiUrl: deps.env.CMDR_API_URL!.trim().replace(/\/+$/, ''),
     ...(deps.env.CMDR_APP_URL?.trim() ? { appUrl: deps.env.CMDR_APP_URL.trim() } : {}),
@@ -467,7 +472,7 @@ async function install(o: Opts, deps: LaunchDeps) {
     // Never the home folder (design 0.2.11, R-8): Claude Code keeps no trust for it, so every unattended start there
     // stalls at its prompt. Default: a folder of the agent's own, made here, by crew and handle so two crews' agents of
     // one handle never share one (launcher design 0.2.13, LS-27).
-    cwd: (o.opt.cwd ?? join(deps.userHome, 'cmdr', crew, me.handle ?? me.id)).replace(/^~(?=\/|$)/, deps.userHome).replace(/\/+$/, '') || '/',
+    cwd: (o.opt.cwd ?? keptCwd ?? join(deps.userHome, 'cmdr', crew, me.handle ?? me.id)).replace(/^~(?=\/|$)/, deps.userHome).replace(/\/+$/, '') || '/',
   }
   if (config.cwd === deps.userHome.replace(/\/+$/, '')) refuse('cwd-is-home', `the agent can't work in your home folder: Claude Code never keeps trust for it. Leave --cwd out (it uses ~/cmdr/${config.crew}/${config.handle}) or name another folder`)
   const unit = unitFor(deps.platform, { userHome: deps.userHome, crew, handle: me.handle ?? me.id, home, bun: deps.bunPath, plugin })!
@@ -793,6 +798,37 @@ function start(o: Opts, deps: LaunchDeps) {
   deps.out(`started: the next tick starts ${sessionName(config.crew, config.handle)}`)
 }
 
+/** `launch set-cwd <dir>` (launcher design 0.2.18, AC-35): move the agent to a folder that exists, then restart the
+ *  launcher through its unit so the daemon reads it (it reads config.json once, at start); its session ends with the
+ *  old daemon and the next starts in the new folder. Refused: the home folder (cwd-is-home), a folder that isn't there
+ *  (cwd-missing, never made here). Each refusal changes nothing. */
+async function setCwd(o: Opts, deps: LaunchDeps) {
+  if (o.pos.length !== 1) refuse('usage', 'launch set-cwd <dir> [--home <dir>]')
+  const home = homeOf(deps, o.opt.home)
+  const dir = join(home, LAUNCHER)
+  const config = readJson<LaunchConfig>(join(dir, CONFIG_FILE))
+  if (!config) refuse('launcher-not-installed', `no launcher in ${home}`)
+  const raw = o.pos[0]!.replace(/^~(?=\/|$)/, deps.userHome)
+  const cwd = (raw.startsWith('/') ? raw : join(process.cwd(), raw)).replace(/\/+$/, '') || '/'
+  if (cwd === deps.userHome.replace(/\/+$/, '')) refuse('cwd-is-home', "the agent can't work in your home folder: name another folder")
+  let isDir = false
+  try {
+    isDir = statSync(cwd).isDirectory()
+  } catch {
+    isDir = false
+  }
+  if (!isDir) refuse('cwd-missing', `no folder at ${cwd}: make it first, or name one that exists`)
+  writeWhole(join(dir, CONFIG_FILE), `${JSON.stringify({ ...config!, cwd }, null, 2)}\n`, 0o600)
+  eventTo(deps, dir, deps.now ?? Date.now)('launcher.cwd-changed')
+  const unit = unitOf(deps, home)
+  if (unit) {
+    const restart = deps.platform === 'darwin' ? ['launchctl', 'kickstart', '-k', `gui/${deps.uid}/${unit.label}`] : ['systemctl', '--user', 'restart', `${unit.label}.service`]
+    const p = await deps.run(restart, SERVICE_TIMEOUT_MS)
+    if (p.code !== 0) refuse('service-failed', firstLine(p))
+  }
+  deps.out(`the agent now works in ${cwd}${unit ? '; its launcher restarted, and its next session starts there' : ''}`)
+}
+
 async function uninstall(o: Opts, deps: LaunchDeps) {
   const home = homeOf(deps, o.opt.home)
   const dir = join(home, LAUNCHER)
@@ -808,7 +844,7 @@ async function uninstall(o: Opts, deps: LaunchDeps) {
   deps.out(`launcher removed from ${home}${unit ? ` (and its service ${unit.label})` : ''}; ${join(home, 'sessions', 'main')} is kept`)
 }
 
-export const LAUNCH_USAGE = `usage: cmdr-agent launch <install|run|status|stop|start|uninstall> [args]
+export const LAUNCH_USAGE = `usage: cmdr-agent launch <install|run|status|stop|start|set-cwd|uninstall> [args]
 
   install [--home <dir>] [--cwd <dir>] [--plugin <folder>]
                                        keep the key here and start the launcher as a login service
@@ -816,6 +852,7 @@ export const LAUNCH_USAGE = `usage: cmdr-agent launch <install|run|status|stop|s
   status [--home <dir>]                the service, the session, and how to attach to it
   stop [--home <dir>]                  end the session and keep it ended (until start)
   start [--home <dir>]                 let the launcher start it again
+  set-cwd <dir> [--home <dir>]         work in another folder (one that exists); the launcher restarts into it
   uninstall [--home <dir>]             remove the service and the key; the session ends with it
 
 install reads CMDR_API_URL and CMDR_AGENT_KEY (and CMDR_STATE_DIR for the home); the others read the home.`
@@ -857,6 +894,7 @@ export async function launch(argv: string[], deps: LaunchDeps): Promise<number> 
     else if (sub === 'stop') await stop(o, deps)
     else if (sub === 'start') start(o, deps)
     else if (sub === 'uninstall') await uninstall(o, deps)
+    else if (sub === 'set-cwd') await setCwd(o, deps)
     else if (sub === undefined || sub === '--help' || sub === 'help') {
       deps.out(LAUNCH_USAGE)
       return sub === undefined ? 2 : 0
