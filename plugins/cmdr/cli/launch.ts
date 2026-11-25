@@ -16,6 +16,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFile
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { ACTIVITY_STATE_FILE, McClient, Mode } from '../agent-client/index.js'
+import type { LauncherAction } from '../agent-client/client.js'
 import { flockExclusive, type Lock } from '../state-dir.js'
 import { CLI_TIMEOUT_MS, parseArgs, RETRY_AFTER_MS } from './main.js'
 
@@ -77,7 +78,7 @@ export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed', 'launch.session.channel-reconnect', 'launch.session.channel-missing', 'launch.restart'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed', 'launch.session.channel-reconnect', 'launch.session.channel-missing', 'launch.restart', 'launch.restart.stale'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -239,6 +240,8 @@ export const PROMPT_MAX_KEYS = 6
  *  `/agent/me` lists a live session; else one `/mcp` reconnect, and CHANNEL_READY_MS after that, `channel-missing`
  *  once. Never a loop, never a restart: Claude Code's failure cache would outlast either. */
 export const CHANNEL_READY_MS = 30_000
+/** A restart asked for longer ago than this is not carried out (0.2.28, SL-1): the same window cmdr.mc reuses one in. */
+export const RESTART_FRESH_MS = 15 * 60_000
 export const RECONNECT_KEYS = '/mcp reconnect plugin:cmdr:cmdr'
 export type ChannelWatch = { since: number; stage: 'waiting' | 'reconnected' | 'done' }
 export type ChannelStep = { watch: ChannelWatch; act: 'none' | 'reconnect' | 'missing' }
@@ -800,8 +803,48 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
       return merged
     }
 
+    // Restarts asked for in cmdr.app (0.2.27 § 3.3 step 7, § 3.5): collected every tick, whatever the session's state.
+    // Carried out here, in the daemon, as `launch restart` would end the session: the session is ended now (an end the
+    // person asked for: no ladder moves) and this tick starts a fresh one. Never through the session's own socket.
+    // Set when this tick ended our own session for a restart: cmdr.mc may list it as live a few seconds longer, and that
+    // listing is ours, not a hand-started session's, so it doesn't hold the fresh start back.
+    let endedForRestart = false
+    const collect = async () => {
+      endedForRestart = false
+      let asked: LauncherAction[] = []
+      try {
+        asked = await client.actions()
+      } catch {
+        return // an older cmdr.mc (404), or unreachable: nothing asked
+      }
+      for (const a of Array.isArray(asked) ? asked : []) {
+        if (typeof a?.id !== 'string') continue
+        const stale = typeof a.stale === 'boolean' ? a.stale : !(Date.parse(a.createdAt) > now() - RESTART_FRESH_MS)
+        const close = (status: 'done' | 'failed', detail?: string) => client.actionDone(a.id, status, detail).catch(() => undefined)
+        if (stale) {
+          event('launch.restart.stale')
+          await close('failed', 'stale')
+          continue
+        }
+        if (readStateFile(dir).stopped) {
+          await close('failed', 'stopped')
+          continue
+        }
+        if (await hasSession(deps, config.tmux, name)) {
+          await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+          event('launch.session.ended', { reason: 'stopped' })
+          save(ended(readStateFile(dir), now(), 'stopped'))
+          wasUp = false
+          endedForRestart = true
+        }
+        event('launch.restart', { source: 'app' })
+        await close('done')
+      }
+    }
+
     const once = async () => {
       if (updated) return
+      await collect()
       const installedNow = installedPlugin(readText(pluginsFile(deps)))
       if (installedNow && installedNow !== runningFrom && existsSync(join(installedNow, 'cli', 'cmdr-agent.ts')) && existsSync(wrapperOf(home))) {
         updated = true
@@ -900,7 +943,7 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
           sinceMe = 1 // asked now: a session it starts is next polled HANDLE_POLL_TICKS ticks on
           try {
             const me = (await retrying(deps, () => client.me())) as unknown as MeSessions
-            otherLive = Array.isArray(me.sessions) && me.sessions.length > 0
+            otherLive = !endedForRestart && Array.isArray(me.sessions) && me.sessions.length > 0
           } catch (e) {
             const code = statusOf(e)
             if (code !== 401 && code !== 403) throw e

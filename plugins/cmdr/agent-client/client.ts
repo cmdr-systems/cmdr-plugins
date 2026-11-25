@@ -14,7 +14,7 @@ export function apiError(status: number, statusText: string, error?: { message?:
 
 /** This plugin's version, as its package.json says it (tests/agent-client/client.spec.ts holds the two together):
  *  what the MCP server names itself and what the socket declares. */
-export const PLUGIN_VERSION = '0.3.11'
+export const PLUGIN_VERSION = '0.3.12'
 /** What this plugin can do that cmdr.mc must know before it acts (general crew channel design § 3.1, AC-10):
  *  `general-channel`, it knows its crew's general channel and no home, so an organization may archive its role channels. */
 export const GENERAL_CHANNEL_CAPABILITY = 'general-channel'
@@ -22,6 +22,9 @@ export const CAPABILITIES: readonly string[] = [GENERAL_CHANNEL_CAPABILITY]
 
 export type ApiInit = { method?: string; body?: unknown; /** abort after this long; absent, the client's own (none in the plugin) */ timeoutMs?: number }
 export type Api = <T>(path: string, init?: ApiInit) => Promise<T>
+
+/** A restart queued for this agent's launcher (`GET /agent/actions`): `stale` is cmdr.mc's word, older than 15 min. */
+export type LauncherAction = { id: string; fresh?: boolean; createdAt: string; stale?: boolean }
 
 /** /agent/me: who the key is (design § 3.2). */
 export type Me = Author & { runsOn?: string; operator?: { id: string; name: string } }
@@ -66,6 +69,11 @@ export class McClient {
   }
 
   me = () => this.api<Me>('/agent/me')
+  /** The launcher's queued actions (session launcher 0.2.27 § 3.5): its restarts, oldest first; asking stamps it seen. */
+  actions = () => this.api<LauncherAction[]>('/agent/actions')
+  /** How one went, once: `done`, or `failed` with why (`stale`, `stopped`, …). */
+  actionDone = (id: string, status: 'done' | 'failed', detail?: string) =>
+    this.api(`/agent/actions/${encodeURIComponent(id)}`, { method: 'POST', body: { status, ...(detail ? { detail } : {}) } })
   people = () => this.api<Person[]>('/agent/people')
   conversations = () => this.api<Conversation[]>('/agent/conversations')
   history = (id: string, limit: number) => this.api<Message[]>(`/agent/conversations/${id}/messages?limit=${limit}`)
