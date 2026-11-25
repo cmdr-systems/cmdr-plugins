@@ -14,7 +14,7 @@ export function apiError(status: number, statusText: string, error?: { message?:
 
 /** This plugin's version, as its package.json says it (tests/agent-client/client.spec.ts holds the two together):
  *  what the MCP server names itself and what the socket declares. */
-export const PLUGIN_VERSION = '0.3.10'
+export const PLUGIN_VERSION = '0.3.11'
 /** What this plugin can do that cmdr.mc must know before it acts (general crew channel design § 3.1, AC-10):
  *  `general-channel`, it knows its crew's general channel and no home, so an organization may archive its role channels. */
 export const GENERAL_CHANNEL_CAPABILITY = 'general-channel'

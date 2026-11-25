@@ -653,6 +653,20 @@ async function retrying<T>(deps: LaunchDeps, f: () => Promise<T>): Promise<T> {
 
 // ── exec (internal: what the daemon runs inside its tmux session) ──
 
+/** The session's own settings (design 0.2.27 § 3.3 step 5, AC-42; LOCAL-AGENTS-43): cmdr's status line, so cmdr.mc
+ *  hears how full the context is, and `idleCompaction: false` (the box's BUGS-9 rule). Read by that session only,
+ *  through `--settings`; the person's own `~/.claude/settings.json` is read, never written. Their own status line runs
+ *  after ours (CMDR_STATUSLINE_NEXT), so their terminal shows what it showed. */
+export const SESSION_SETTINGS_FILE = 'session-settings.json'
+export function sessionSettings(bun: string, pluginDir: string, own: unknown): { settings: Record<string, unknown>; next: string | null } {
+  const sl = own && typeof own === 'object' ? (own as { statusLine?: { type?: unknown; command?: unknown; padding?: unknown } }).statusLine : undefined
+  const next = sl && sl.type === 'command' && typeof sl.command === 'string' && sl.command.trim() ? sl.command : null
+  const q = (p: string) => `'${p.replace(/'/g, `'\\''`)}'`
+  const statusLine: Record<string, unknown> = { type: 'command', command: `${q(bun)} ${q(join(pluginDir, 'statusline.ts'))}` }
+  if (next && typeof sl!.padding === 'number') statusLine.padding = sl!.padding
+  return { settings: { statusLine, idleCompaction: false }, next }
+}
+
 function exec(o: Opts, deps: LaunchDeps) {
   if (o.pos.length) refuse('usage', 'launch exec --home <dir>')
   const home = homeOf(deps, o.opt.home)
@@ -671,8 +685,13 @@ function exec(o: Opts, deps: LaunchDeps) {
     CMDR_AGENT_KEY: key,
     CMDR_STATE_DIR: stateDir,
   })
+  const own = readJson<unknown>(join(deps.env.CLAUDE_CONFIG_DIR?.trim() || join(deps.userHome, '.claude'), 'settings.json'))
+  const { settings, next } = sessionSettings(config.bun, deps.pluginDir.replace(/\/+$/, ''), own)
+  const settingsPath = join(home, LAUNCHER, SESSION_SETTINGS_FILE)
+  writeWhole(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, 0o600)
+  if (next) env.CMDR_STATUSLINE_NEXT = next
   deps.chdir(config.cwd)
-  deps.execve(config.claude, [config.claude, '--dangerously-load-development-channels', 'plugin:cmdr@cmdr-crew'], env)
+  deps.execve(config.claude, [config.claude, '--dangerously-load-development-channels', 'plugin:cmdr@cmdr-crew', '--settings', settingsPath], env)
 }
 
 // ── run (the daemon) ──
