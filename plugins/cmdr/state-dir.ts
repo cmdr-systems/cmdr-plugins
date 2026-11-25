@@ -15,18 +15,26 @@
 // Only the lock's holder probes or removes, so neither can race. External mode only: a box's start keeps its own
 // remove-and-rebind (server.ts), unchanged.
 import { dlopen, FFIType } from 'bun:ffi'
-import { closeSync, openSync, rmSync } from 'node:fs'
+import { closeSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const LOCK_FILE = 'activity.lock'
 export const ACTIVITY_SOCK_FILE = 'activity.sock'
+/** Who holds the directory (LOCAL-AGENTS-41): written by the holder once bound, so a session refused can name it. */
+export const HOLDER_FILE = 'activity.holder'
+export type Holder = { pid: number; server: number; since: string; session: string | null }
 /** How long a probe of the directory's socket waits for an answer: a live hooks server answers locally at once. */
 export const STATE_DIR_PROBE_MS = 1_000
 
 /** The start's refusal, said in the line the other start refusals use. */
 export class StateDirInUse extends Error {
   readonly code = 'state-dir-in-use'
-  constructor(dir: string, why: 'locked' | 'answering') {
+  constructor(
+    readonly dir: string,
+    why: 'locked' | 'answering',
+    /** The holder, when it wrote itself down (a session from before LOCAL-AGENTS-41 didn't). */
+    readonly holder: Holder | null = null,
+  ) {
     super(
       why === 'locked'
         ? `state-dir-in-use: another session of this agent is running in ${dir}. Start this one with its own CMDR_STATE_DIR (for example …/sessions/<name>).`
@@ -43,6 +51,9 @@ export type ClaimDeps<S> = {
   probe: (sock: string) => Promise<boolean>
   rm: (sock: string) => void
   bind: (sock: string) => S
+  /** Write this session down as the holder, once bound; and read the holder down there. */
+  writeHolder?: (dir: string) => void
+  readHolder?: (dir: string) => Holder | null
   /** A test's seam between taking the lock and the rest (PL-8): never set in production, never an environment variable. */
   afterLock?: () => Promise<void>
 }
@@ -51,14 +62,18 @@ export type ClaimDeps<S> = {
 export async function claimStateDir<S>(dir: string, deps: ClaimDeps<S>): Promise<{ server: S; lock: Lock }> {
   const sock = join(dir, ACTIVITY_SOCK_FILE)
   const lock = deps.lock(join(dir, LOCK_FILE))
-  if (!lock) throw new StateDirInUse(dir, 'locked')
+  if (!lock) throw new StateDirInUse(dir, 'locked', deps.readHolder?.(dir) ?? null)
   await deps.afterLock?.()
   if (await deps.probe(sock)) {
     lock.release()
     throw new StateDirInUse(dir, 'answering')
   }
   deps.rm(sock)
-  return { server: deps.bind(sock), lock }
+  const server = deps.bind(sock)
+  try {
+    deps.writeHolder?.(dir)
+  } catch {}
+  return { server, lock }
 }
 
 const LOCK_EX = 2
@@ -99,9 +114,28 @@ export async function probeSocket(sock: string, ms = STATE_DIR_PROBE_MS): Promis
   }
 }
 
+/** The holder file's record: Claude Code's process (this server's parent) and its session id, this server, and since when. */
+export function writeHolderFile(dir: string, now = () => new Date()): void {
+  const h: Holder = { pid: process.ppid, server: process.pid, since: now().toISOString(), session: process.env.CLAUDE_CODE_SESSION_ID?.trim() || null }
+  writeFileSync(join(dir, HOLDER_FILE), `${JSON.stringify(h)}\n`, { mode: 0o600 })
+}
+/** The holder written down, or null (none, or not well formed: never trusted beyond its fields). */
+export function readHolderFile(dir: string): Holder | null {
+  try {
+    const h = JSON.parse(readFileSync(join(dir, HOLDER_FILE), 'utf8')) as Partial<Holder>
+    if (!(Number.isInteger(h.pid) && Number.isInteger(h.server) && typeof h.since === 'string')) return null
+    const session = typeof h.session === 'string' && /^[\w-]{1,64}$/.test(h.session) ? h.session : null
+    return { pid: h.pid!, server: h.server!, since: h.since, session }
+  } catch {
+    return null
+  }
+}
+
 export const realClaimDeps = <S>(bind: (sock: string) => S): ClaimDeps<S> => ({
   lock: flockExclusive,
   probe: (sock) => probeSocket(sock),
   rm: (sock) => rmSync(sock, { force: true }),
   bind,
+  writeHolder: (dir) => writeHolderFile(dir),
+  readHolder: readHolderFile,
 })

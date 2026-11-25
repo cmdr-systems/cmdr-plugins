@@ -77,7 +77,7 @@ export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed', 'launch.session.channel-reconnect', 'launch.session.channel-missing', 'launch.restart'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -234,6 +234,29 @@ export function answerFor(screen: string, folders: readonly string[]): PromptAns
 export const PROMPT_WATCH_MS = 90_000
 export const PROMPT_POLL_MS = 1_000
 export const PROMPT_MAX_KEYS = 6
+
+/** The channel must come up (design 0.2.27 § 3.3 step 6, LOCAL-AGENTS-41): within CHANNEL_READY_MS of a start,
+ *  `/agent/me` lists a live session; else one `/mcp` reconnect, and CHANNEL_READY_MS after that, `channel-missing`
+ *  once. Never a loop, never a restart: Claude Code's failure cache would outlast either. */
+export const CHANNEL_READY_MS = 30_000
+export const RECONNECT_KEYS = '/mcp reconnect plugin:cmdr:cmdr'
+export type ChannelWatch = { since: number; stage: 'waiting' | 'reconnected' | 'done' }
+export type ChannelStep = { watch: ChannelWatch; act: 'none' | 'reconnect' | 'missing' }
+
+/** One look at a watch. `live`: `/agent/me` listed a session (null: not asked, or it didn't answer: nothing moves). */
+export function channelStep(w: ChannelWatch, live: boolean | null, now: number): ChannelStep {
+  if (w.stage === 'done' || now - w.since < CHANNEL_READY_MS || live === null) return { watch: w, act: 'none' }
+  if (live) return { watch: { ...w, stage: 'done' }, act: 'none' }
+  if (w.stage === 'waiting') return { watch: { since: now, stage: 'reconnected' }, act: 'reconnect' }
+  return { watch: { ...w, stage: 'done' }, act: 'missing' }
+}
+
+/** Whether the screen is Claude Code idle at its own input box, the one screen a reconnect is typed into (step 3d's
+ *  discipline): no question waiting, and the input marker on an otherwise empty line. */
+export function idleAtInput(screen: string): boolean {
+  if (screen.replace(/\s+/g, '').includes('Entertoconfirm')) return false
+  return screen.split('\n').some((l) => /^\s*❯\s*$/.test(l))
+}
 
 /** What the login service is told to run: paths alone, never the key or any environment (design § 3.1, § 7). */
 export type UnitPaths = { userHome: string; crew: string; handle: string; home: string; bun: string; plugin: string }
@@ -745,6 +768,8 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
     let refusedUntil = 0 // a refused key: /agent/me again only after REFUSED_RETRY_MS (AC-7)
     let sinceMe = HANDLE_POLL_TICKS // ticks with the session up since the last poll: the first tick polls (0.2.26)
     let refusedUp = false // a generic 401 while the session is up, logged once until a poll answers (AC-40 b)
+    // This start's channel watch (0.2.27 step 6); a session adopted at the daemon's start is watched from then.
+    let watch: ChannelWatch | null = wasUp ? { since: now(), stage: 'waiting' } : null
 
     // The mark is `stop`'s and `start`'s to write, never the daemon's (design § 3.3). A tick holds the state it read
     // at its top across awaits (tmux, cmdr.mc, a spawn's five seconds), and wrote that whole object back: a `launch
@@ -822,6 +847,32 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
           }
         }
       }
+      // The channel must come up (0.2.27 step 6): asked only while a watch is open and its 30 s have passed.
+      if (up && !st.stopped && watch && watch.stage !== 'done' && now() - watch.since >= CHANNEL_READY_MS) {
+        let live: boolean | null = null
+        try {
+          const me = (await retrying(deps, () => client.me())) as unknown as MeSessions
+          live = Array.isArray(me.sessions) && me.sessions.length > 0
+        } catch {
+          live = null
+        }
+        // Unanswered (unreachable or refused): the other arms say so, and the watch closes unsaid rather than ask
+        // every tick; the channel can't be judged while cmdr.mc can't be asked.
+        if (live === null) {
+          watch = { ...watch, stage: 'done' }
+          return
+        }
+        const step = channelStep(watch, live, now())
+        if (step.act === 'reconnect') {
+          const cap = await deps.run([...tmuxOn(config.tmux), 'capture-pane', '-p', '-t', `=${name}:`], TMUX_TIMEOUT_MS)
+          // Only into the screen it knows; any other, it looks again next tick, the watch unmoved.
+          if (cap.code !== 0 || !idleAtInput(cap.stdout)) return
+          await deps.run([...tmuxOn(config.tmux), 'send-keys', '-t', `=${name}:`, '-l', RECONNECT_KEYS], TMUX_TIMEOUT_MS)
+          await deps.run([...tmuxOn(config.tmux), 'send-keys', '-t', `=${name}:`, 'Enter'], TMUX_TIMEOUT_MS)
+          event('launch.session.channel-reconnect')
+        } else if (step.act === 'missing') event('launch.session.channel-missing')
+        watch = step.watch
+      }
       let authorized = true
       let otherLive = false
       if (!up && !st.stopped) {
@@ -874,6 +925,7 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
       }
       st = save(st)
       wasUp = true
+      watch = { since: now(), stage: 'waiting' }
       event('launch.session.started')
       asked.waiting = false
       if (!st.stopped) await answerPrompts(deps, config, name, event, PROMPT_WATCH_MS, now, sleep, asked)
@@ -975,6 +1027,30 @@ async function stop(o: Opts, deps: LaunchDeps) {
   deps.out(`stopped: ${name} (it stays stopped until ${wrapperOf(homeOf(deps, o.opt.home))} launch start --home ${homeOf(deps, o.opt.home)})`)
 }
 
+/** `launch restart` (launcher design 0.2.27 § 3.1, AC-41; LOCAL-AGENTS-42): the session ends and a fresh one starts at
+ *  once, by restarting the launcher's unit (`launchctl kickstart -k`, `systemctl --user restart`), as `set-cwd` does.
+ *  The old daemon's SIGTERM kills its session; the new one's first tick starts a fresh one, with no backoff (a restart
+ *  is not a crash). Refused, changing nothing: `stopped` while the stopped mark is set (`launch start` resumes), and
+ *  `launcher-not-installed` with no unit. `--source desktop` when the desktop app runs it; `cli` otherwise. */
+export const RESTART_SOURCES = ['cli', 'desktop', 'app'] as const
+async function restart(o: Opts, deps: LaunchDeps) {
+  if (o.pos.length) refuse('usage', 'launch restart [--home <dir>]')
+  const source = o.opt.source ?? 'cli'
+  if (!(RESTART_SOURCES as readonly string[]).includes(source)) refuse('usage', `launch restart --source ${RESTART_SOURCES.join('|')}`)
+  const home = homeOf(deps, o.opt.home)
+  const dir = join(home, LAUNCHER)
+  const config = readJson<LaunchConfig>(join(dir, CONFIG_FILE))
+  if (!config) refuse('launcher-not-installed', `no launcher in ${home}`)
+  if (readStateFile(dir).stopped) refuse('stopped', `the agent is stopped: ${wrapperOf(home)} launch start --home ${home} starts it`)
+  const unit = unitOf(deps, home)
+  if (!unit) refuse('launcher-not-installed', `no login service for ${home}: set the agent up on this machine again`)
+  const cmd = deps.platform === 'darwin' ? ['launchctl', 'kickstart', '-k', `gui/${deps.uid}/${unit!.label}`] : ['systemctl', '--user', 'restart', `${unit!.label}.service`]
+  const p = await deps.run(cmd, SERVICE_TIMEOUT_MS)
+  if (p.code !== 0) refuse('service-failed', firstLine(p))
+  eventTo(deps, dir, deps.now ?? Date.now)('launch.restart', { source })
+  deps.out(`restarted: ${sessionOf(config!, readStateFile(dir))} starts fresh`)
+}
+
 function start(o: Opts, deps: LaunchDeps) {
   const { dir, config } = mark(o, deps, false)
   deps.out(`started: the next tick starts ${sessionOf(config, readStateFile(dir))}`)
@@ -1026,7 +1102,7 @@ async function uninstall(o: Opts, deps: LaunchDeps) {
   deps.out(`launcher removed from ${home}${unit ? ` (and its service ${unit.label})` : ''}; ${join(home, 'sessions', 'main')} is kept`)
 }
 
-export const LAUNCH_USAGE = `usage: cmdr-agent launch <install|run|status|stop|start|set-cwd|uninstall> [args]
+export const LAUNCH_USAGE = `usage: cmdr-agent launch <install|run|status|stop|start|restart|set-cwd|uninstall> [args]
 
   install [--home <dir>] [--cwd <dir>] [--plugin <folder>] [--tmux <path>]
                                        keep the key here and start the launcher as a login service
@@ -1034,6 +1110,7 @@ export const LAUNCH_USAGE = `usage: cmdr-agent launch <install|run|status|stop|s
   status [--home <dir>]                the service, the session, and how to attach to it
   stop [--home <dir>]                  end the session and keep it ended (until start)
   start [--home <dir>]                 let the launcher start it again
+  restart [--home <dir>]               end the session; a fresh one starts at once (refused while stopped)
   set-cwd <dir> [--home <dir>]         work in another folder (one that exists); the launcher restarts into it
   uninstall [--home <dir>]             remove the service and the key; the session ends with it
 
@@ -1067,7 +1144,7 @@ export function realLaunchDeps(base: Pick<LaunchDeps, 'env' | 'out' | 'err' | 'f
 export async function launch(argv: string[], deps: LaunchDeps): Promise<number> {
   const [sub, ...rest] = argv
   try {
-    const flags = ['home', 'cwd', 'plugin', 'tmux']
+    const flags = ['home', 'cwd', 'plugin', 'tmux', 'source']
     const o = parseArgs(rest, flags, ['all'])
     if (sub === 'install') await install(o, deps)
     else if (sub === 'run') return await daemon(o, deps)
@@ -1075,6 +1152,7 @@ export async function launch(argv: string[], deps: LaunchDeps): Promise<number> 
     else if (sub === 'status') await status(o, deps)
     else if (sub === 'stop') await stop(o, deps)
     else if (sub === 'start') start(o, deps)
+    else if (sub === 'restart') await restart(o, deps)
     else if (sub === 'uninstall') await uninstall(o, deps)
     else if (sub === 'set-cwd') await setCwd(o, deps)
     else if (sub === undefined || sub === '--help' || sub === 'help') {

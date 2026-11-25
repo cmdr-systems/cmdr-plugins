@@ -44,7 +44,8 @@ import { startChannel, type Api } from './channel.js'
 import { McClient } from './agent-client/client.js'
 import type { Attachment, FileTransport } from './files.js'
 import { MODE_FILE } from './mode.js'
-import { ACTIVITY_SOCK_FILE, claimStateDir, realClaimDeps } from './state-dir.js'
+import { standDown } from './stand-down.js'
+import { ACTIVITY_SOCK_FILE, claimStateDir, realClaimDeps, StateDirInUse } from './state-dir.js'
 
 const API = (process.env.CMDR_API_URL ?? '').replace(/\/+$/, '')
 const KEY = (process.env.CMDR_AGENT_KEY ?? '').trim()
@@ -154,8 +155,11 @@ const serveHooks = (sock: string) => {
 }
 
 // A refusal at start (a doc agent; a local agent without CMDR_STATE_DIR) is said and the process ends: no socket
-// was opened (local-agents design § 3.3).
-channel = await startChannel({
+// was opened (local-agents design § 3.3). Except `state-dir-in-use`: another session holds this agent's directory, and
+// this one stands down (stand-down.ts, LOCAL-AGENTS-41) rather than fail, since Claude Code caches a failure for the
+// folder and would skip the agent's own next session.
+const transport = new StdioServerTransport()
+const started = await startChannel({
   api,
   files,
   inboxDir: join(STATE_DIR, 'inbox'),
@@ -167,7 +171,7 @@ channel = await startChannel({
       ask: (event: string, data: unknown, ms: number) => (s.connected ? s.timeout(ms).emitWithAck(event, data) : Promise.reject(new Error('not connected'))),
     })
   },
-  transport: new StdioServerTransport(),
+  transport,
   witnessDir: WITNESS_DIR,
   stateDir: STATE_DIR,
   stateDirSet: STATE_DIR_SET,
@@ -199,10 +203,17 @@ channel = await startChannel({
   },
   log,
   stamp,
-}).catch((e: unknown) => {
+}).catch(async (e: unknown) => {
+  if (e instanceof StateDirInUse) {
+    await standDown({ transport, dir: e.dir, holder: e.holder, log, stamp })
+    return null
+  }
   process.stderr.write(`cmdr channel: ${e instanceof Error ? e.message : String(e)}\n`)
   process.exit(1)
 })
+// Standing down: the MCP server is up with no tools; nothing else here runs, and the process ends with Claude Code's.
+if (!started) await new Promise<never>(() => {})
+channel = started!
 
 // Where it runs, for its hooks (mode.ts MODE_FILE): a local agent's hooks hand over its prompts and answers.
 if (channel.mode === 'external') writeFileSync(join(STATE_DIR, MODE_FILE), 'external', { mode: 0o600 })

@@ -476,7 +476,6 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
   // From here on only the session's hooks move it (activity() below): handing
   // it something is not a turn.
   const session = deps.activityStatePath ? sessionStateWriter({ path: deps.activityStatePath, log }) : null
-  session?.mark('idle')
 
   const me = await api<Author>('/agent/me')
   // Where it runs (local-agents design § 3.3): a doc agent never runs this module; a local agent needs its own state
@@ -489,6 +488,8 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
   // One live session per state directory (sessions design 0.1.6 § 3.4): claimed here, after /agent/me said where it
   // runs and before the socket to cmdr.mc; refused `state-dir-in-use`, nothing opened.
   if (external) await deps.claimStateDir?.()
+  // Marked only once the directory is this session's: a session refused never touches the holder's state (LOCAL-AGENTS-41).
+  session?.mark('idle')
   stamp(`mode ${mode}`)
   const isQueue = isQueueArchetype(me.archetype ?? deps.archetypeHint)
   const offered = offeredWork(me.archetype ?? deps.archetypeHint)
