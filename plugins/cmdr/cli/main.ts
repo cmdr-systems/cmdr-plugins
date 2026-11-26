@@ -45,6 +45,9 @@ export const USAGE = `usage: cmdr-agent <verb> [args]
                                        print each message for you as a <channel …> line, until interrupted; it
                                        declares its scope first (main unless told), as a session does
   sessions                             your live sessions: scope, channel, since
+  home pull|push|release --cwd <dir> [--machine-file <path>]
+                                       the agent's home (agent home sync § 3.4), for a box: pull before a start,
+                                       push each round, push and release on a clean stop; prints counts only
   launch install|run|status|stop|start|uninstall …
                                        the session launcher: a login service that keeps one session of yours
                                        running, until you stop it (cmdr-agent launch --help)
@@ -52,7 +55,10 @@ export const USAGE = `usage: cmdr-agent <verb> [args]
 env: CMDR_API_URL, CMDR_AGENT_KEY (every verb but launch, whose own --help says); CMDR_STATE_DIR (link, unlink: a live session's directory); CMDR_APP_URL (links, optional)
 A refusal is one line on stderr, "refused: <reason>", and exit 1.`
 
-export const VERBS = ['me', 'conversations', 'history', 'reply', 'react', 'search', 'tasks', 'task', 'offers', 'respond', 'waiting', 'link', 'unlink', 'listen', 'sessions', 'launch'] as const
+/** `cmdr-agent home push`'s exit when the home moved under another machine: restart the agent (design 0.1.17, H-23). */
+export const HOME_MOVED_EXIT = 3
+
+export const VERBS = ['me', 'conversations', 'history', 'reply', 'react', 'search', 'tasks', 'task', 'offers', 'respond', 'waiting', 'link', 'unlink', 'listen', 'sessions', 'home', 'launch'] as const
 export type Verb = (typeof VERBS)[number]
 
 /** The socket the listen verb needs: socket.io's, or a test's. */
@@ -243,6 +249,8 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
     await verbs[verb as Exclude<Verb, 'launch'>](rest, { client, deps, retrying, event })
     return 0
   } catch (e) {
+    // `home push` meeting a moved home (design 0.1.17): its own exit code, which the box's push timer acts on.
+    if (e instanceof Error && e.message === 'home-moved') return HOME_MOVED_EXIT
     const line = e instanceof Refusal ? e.message : statusOf(e) !== null ? `server-refused: ${(e as Error).message}` : `unreachable: ${(e as Error)?.message ?? String(e)}`
     event(`agent-client.refused reason=${line.split(':')[0]}`)
     deps.err(`refused: ${line}`)
@@ -496,6 +504,49 @@ const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<
     const me = (await meOf(ctx)) as Me & { sessions?: { scope: string; conversationId?: string; label?: string; since: string }[] }
     const all = me.sessions ?? []
     ctx.deps.out(all.map((s) => `${s.scope}${s.scope === 'linked' ? `  #${s.label ?? s.conversationId}` : ''}  since ${s.since}`).join('\n') || '(no sessions)')
+  },
+  // The box's half of agent home sync (design 0.1.9 § 2, AC-7, AC-12): the same pull, push and release the Mac
+  // launcher runs in-process. Each call takes or renews this machine's lease first (the same machine gets the same
+  // lease back). Prints counts, never a path or content.
+  home: async (a, ctx) => {
+    const p = parseArgs(a, ['cwd', 'machine-file'])
+    const step = p.pos[0]
+    if (p.pos.length !== 1 || !['pull', 'push', 'release'].includes(step!)) refuse('usage', 'home pull|push|release --cwd <dir> [--machine-file <path>]')
+    const cwd = p.opt.cwd ?? refuse('usage', '--cwd <dir>: the agent\'s working directory')
+    const { machine } = await import('../home/machine.js')
+    const home = await import('../home/home-sync.js')
+    const m = p.opt['machine-file'] ? machine(p.opt['machine-file']) : machine()
+    const hctx = { client: ctx.client, machine: m, cwd, memoryDir: home.memoryDirOf(cwd, ctx.deps.env as NodeJS.ProcessEnv), fetch: ctx.deps.fetch }
+    if (step === 'pull') {
+      const r = await home.pull(hctx)
+      ctx.deps.out(`pulled: revision ${r.revision}, ${r.fetched} fetched, ${r.deleted} deleted, ${r.conflicts} set aside`)
+      return
+    }
+    const { leaseId } = await ctx.client.homeLease(m)
+    if (step === 'push') {
+      let r
+      try {
+        r = await home.push(hctx, leaseId)
+      } catch (e) {
+        if (!(e instanceof home.HomeMoved)) throw e
+        // The home moved while this box didn't hold it (H725-5). A pull never runs under a live session (design 0.1.17,
+        // H-23): nothing is pushed, and the exit code (HOME_MOVED_EXIT) asks the push timer's privileged post step to
+        // restart the agent's unit, whose ExecStopPost releases and ExecStartPre pulls.
+        ctx.deps.out('home moved: nothing pushed; the agent restarts so its start pulls')
+        throw e
+      }
+      let put = r.put
+      let deleted = r.deleted
+      while (r.more) {
+        r = await home.push(hctx, leaseId)
+        put += r.put
+        deleted += r.deleted
+      }
+      ctx.deps.out(`pushed: ${put} changed, ${deleted} deleted`)
+      return
+    }
+    const r = await home.release(hctx, leaseId)
+    ctx.deps.out(`released${r.pushed ? `: ${r.pushed.put} changed, ${r.pushed.deleted} deleted` : ''}`)
   },
 }
 

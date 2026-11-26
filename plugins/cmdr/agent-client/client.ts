@@ -9,22 +9,38 @@ import type { Person } from './hearing.js'
 
 /** A cmdr.mc refusal as one line: `<status> <code>: <message>` (the plugin's tools say it as it is). */
 export function apiError(status: number, statusText: string, error?: { message?: string; code?: string }): Error {
-  return new Error(`${status} ${error?.code ? `${error.code}: ` : ''}${error?.message ?? statusText}`)
+  // The message as before (callers parse `<status> <code>:`); the status, code and the refusal's own fields ride along
+  // for those that need them (agent home: lease-held's machineName).
+  return Object.assign(new Error(`${status} ${error?.code ? `${error.code}: ` : ''}${error?.message ?? statusText}`), { status, code: error?.code ?? null, detail: error ?? null })
+}
+
+/** A cmdr.mc refusal's status, code and fields, from an error apiError made (else nulls). */
+export function refusalOf(e: unknown): { status: number | null; code: string | null; detail: Record<string, unknown> | null } {
+  const x = e as { status?: unknown; code?: unknown; detail?: unknown } | null
+  return { status: typeof x?.status === 'number' ? x.status : null, code: typeof x?.code === 'string' ? x.code : null, detail: x?.detail && typeof x.detail === 'object' ? (x.detail as Record<string, unknown>) : null }
 }
 
 /** This plugin's version, as its package.json says it (tests/agent-client/client.spec.ts holds the two together):
  *  what the MCP server names itself and what the socket declares. */
-export const PLUGIN_VERSION = '0.3.12'
+export const PLUGIN_VERSION = '0.3.15'
 /** What this plugin can do that cmdr.mc must know before it acts (general crew channel design § 3.1, AC-10):
  *  `general-channel`, it knows its crew's general channel and no home, so an organization may archive its role channels. */
 export const GENERAL_CHANNEL_CAPABILITY = 'general-channel'
 export const CAPABILITIES: readonly string[] = [GENERAL_CHANNEL_CAPABILITY]
 
-export type ApiInit = { method?: string; body?: unknown; /** abort after this long; absent, the client's own (none in the plugin) */ timeoutMs?: number }
+export type ApiInit = { method?: string; body?: unknown; /** abort after this long; absent, the client's own (none in the plugin) */ timeoutMs?: number; /** extra request headers (agent home: X-Cmdr-Machine) */ headers?: Record<string, string> }
 export type Api = <T>(path: string, init?: ApiInit) => Promise<T>
 
 /** A restart queued for this agent's launcher (`GET /agent/actions`): `stale` is cmdr.mc's word, older than 15 min. */
-export type LauncherAction = { id: string; fresh?: boolean; createdAt: string; stale?: boolean }
+export type LauncherAction = { id: string; fresh?: boolean; createdAt: string; stale?: boolean; /** absent: a restart; `release_home`: a transfer asks this machine to let the agent's home go (agent home sync § 3.4) */ kind?: string }
+
+/** Agent home (agent home sync design 0.1.9 § 3.3). */
+export type HomeEntry = { path: string; md5: string; size: number }
+export type HomeManifest = { revision: number; entries: HomeEntry[] }
+export type HomeLease = { leaseId: string; epoch: number; expiresAt: string }
+export type SignedWrite = { url: string; method: 'PUT'; headers: Record<string, string> }
+export type HomeLinks = { read: Record<string, string>; write: Record<string, SignedWrite>; present: string[] }
+export type HomeCommitted = { committedAt: string; revision: number; entries: HomeEntry[] }
 
 /** /agent/me: who the key is (design § 3.2). */
 export type Me = Author & { runsOn?: string; operator?: { id: string; name: string } }
@@ -49,7 +65,7 @@ export class McClient {
       const timeoutMs = init.timeoutMs ?? opts.timeoutMs
       const res = await doFetch(`${opts.apiUrl}${path}`, {
         method: init.method ?? 'GET',
-        headers: { 'X-Cmdr-Api-Key': opts.key, Accept: 'application/json', ...(init.body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+        headers: { 'X-Cmdr-Api-Key': opts.key, Accept: 'application/json', ...(init.body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(init.headers ?? {}) },
         body: init.body === undefined ? undefined : JSON.stringify(init.body),
         ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
       })
@@ -69,8 +85,17 @@ export class McClient {
   }
 
   me = () => this.api<Me>('/agent/me')
-  /** The launcher's queued actions (session launcher 0.2.27 § 3.5): its restarts, oldest first; asking stamps it seen. */
-  actions = () => this.api<LauncherAction[]>('/agent/actions')
+  /** The launcher's queued actions (session launcher 0.2.27 § 3.5): its restarts, oldest first; asking stamps it seen.
+   *  `releaseHome`: a transfer's `release_home` too (agent home sync § 3.3); only a launcher that syncs asks. */
+  actions = (opts: { releaseHome?: boolean } = {}) => this.api<LauncherAction[]>(opts.releaseHome ? '/agent/actions?with=release_home' : '/agent/actions')
+
+  /** Agent home (design 0.1.9 § 3.3): every call names this machine. */
+  private home = <T>(path: string, machineId: string, init: ApiInit = {}) => this.api<T>(`/agent/home/${path}`, { ...init, headers: { 'X-Cmdr-Machine': machineId } })
+  homeLease = (m: { machineId: string; machineName: string }) => this.home<HomeLease>('lease', m.machineId, { method: 'POST', body: m })
+  homeManifest = (machineId: string) => this.home<HomeManifest>('manifest', machineId)
+  homeLinks = (machineId: string, body: { leaseId: string; read?: string[]; write?: { md5: string; size: number }[] }) => this.home<HomeLinks>('links', machineId, { method: 'POST', body })
+  homeCommit = (machineId: string, body: { leaseId: string; baseRevision: number; put: HomeEntry[]; delete: string[] }) => this.home<HomeCommitted>('commit', machineId, { method: 'POST', body })
+  homeRelease = (machineId: string, leaseId: string) => this.home<{ released: boolean }>('release', machineId, { method: 'POST', body: { leaseId } })
   /** How one went, once: `done`, or `failed` with why (`stale`, `stopped`, …). */
   actionDone = (id: string, status: 'done' | 'failed', detail?: string) =>
     this.api(`/agent/actions/${encodeURIComponent(id)}`, { method: 'POST', body: { status, ...(detail ? { detail } : {}) } })

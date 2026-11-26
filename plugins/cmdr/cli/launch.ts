@@ -16,7 +16,9 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFile
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { ACTIVITY_STATE_FILE, McClient, Mode } from '../agent-client/index.js'
-import type { LauncherAction } from '../agent-client/client.js'
+import { refusalOf, type LauncherAction } from '../agent-client/client.js'
+import { HomeMoved, LeaseLost, memoryDirOf, pull as homePull, push as homePush, readState as readHomeState, release as homeRelease, type Ctx as HomeCtx } from '../home/home-sync.js'
+import { machine as thisMachine, type Machine } from '../home/machine.js'
 import { flockExclusive, type Lock } from '../state-dir.js'
 import { CLI_TIMEOUT_MS, parseArgs, RETRY_AFTER_MS } from './main.js'
 
@@ -44,7 +46,13 @@ export type LaunchState = {
   stopped: boolean
   /** Why it's stopped, when it wasn't a person's `launch stop` (remove/rename design AC-4; connect 0.2.9 reads it as
    *  `removed`): its agent was removed from its crew. Cleared by `start` and `stop`. */
-  stoppedReason?: 'agent-removed'
+  stoppedReason?: 'agent-removed' | 'home-released'
+  /** The machine holding this agent's home lease, when a start was refused for it (agent home sync § 3.4,
+   *  `held-elsewhere`): what the desktop app shows. Cleared when this machine takes the lease. */
+  heldBy?: string
+  /** `off`: cmdr.mc has agent homes switched off (design 0.1.15): this session runs without syncing; the next start
+   *  asks again. Cleared on a successful pull. */
+  homeSync?: 'off'
   lastStartAt: string | null
   lastEndAt: string | null
   /** 0..2: the index into BACKOFF_STEPS_MS of the next early-exit wait */
@@ -62,6 +70,8 @@ export const EARLY_EXIT_MS = 60_000
 /** The backoff ladder after early exits: 1, 5, then 15 minutes, holding at 15 (design § 3.3, § 5). */
 export const BACKOFF_STEPS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const
 export const TICK_MS = 30_000
+/** A transfer's release waits this long for the session's turn to end, then stops it anyway (agent home sync § 3.4). */
+export const RELEASE_TURN_MS = 90_000
 /** A refused key: `/agent/me` again this often, staying up (design § 3.3 step 3, AC-7). */
 export const REFUSED_RETRY_MS = 5 * 60_000
 /** With the session up, `/agent/me` on the daemon's first tick and then every this many ticks (every 5 minutes): a
@@ -78,7 +88,7 @@ export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed', 'launch.session.channel-reconnect', 'launch.session.channel-missing', 'launch.restart', 'launch.restart.stale'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed', 'launch.session.channel-reconnect', 'launch.session.channel-missing', 'launch.restart', 'launch.restart.stale', 'launch.home.pulled', 'launch.home.pushed', 'launch.home.held-elsewhere', 'launch.home.released', 'launch.home.failed'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -355,6 +365,10 @@ export type LaunchDeps = {
   /** launch run ends when this aborts (SIGTERM from the service manager) */
   stop?: AbortSignal
   lock?: (path: string) => Lock | null
+  /** This machine (agent home sync § 2): its id from ~/.cmdr/machine.json; tests give one. */
+  machine?: Machine
+  /** The agent's Claude Code memory folder for its cwd (§ 3.2); tests give one. */
+  memoryDir?: string
 }
 
 /** A refusal: `refused: <reason>[: <detail>]` on stderr, exit 1 (as every verb, design § 3.1). */
@@ -492,7 +506,7 @@ const readStateFile = (dir: string): LaunchState => {
   if (!j) return { ...FRESH_STATE }
   const iso = (v: unknown) => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? v : null)
   const step = j.backoffStep === 1 || j.backoffStep === 2 ? j.backoffStep : 0
-  return { stopped: j.stopped === true, ...(j.stopped === true && j.stoppedReason === 'agent-removed' ? { stoppedReason: 'agent-removed' as const } : {}), lastStartAt: iso(j.lastStartAt), lastEndAt: iso(j.lastEndAt), backoffStep: step, backoffUntil: iso(j.backoffUntil), ...(typeof j.handle === 'string' && HANDLE.test(j.handle) ? { handle: j.handle } : {}) }
+  return { stopped: j.stopped === true, ...(j.stopped === true && (j.stoppedReason === 'agent-removed' || j.stoppedReason === 'home-released') ? { stoppedReason: j.stoppedReason } : {}), ...(typeof j.heldBy === 'string' && j.heldBy ? { heldBy: j.heldBy.slice(0, 80) } : {}), ...(j.homeSync === 'off' ? { homeSync: 'off' as const } : {}), lastStartAt: iso(j.lastStartAt), lastEndAt: iso(j.lastEndAt), backoffStep: step, backoffUntil: iso(j.backoffUntil), ...(typeof j.handle === 'string' && HANDLE.test(j.handle) ? { handle: j.handle } : {}) }
 }
 const writeStateFile = (dir: string, st: LaunchState) => writeWhole(join(dir, STATE_FILE), `${JSON.stringify(st, null, 2)}\n`, 0o600)
 /** The session's `activity.state` (the plugin writes it; the launcher only reads it, for `status`). */
@@ -772,6 +786,29 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
   try {
     const client = McClient.create({ apiUrl: config.apiUrl, key, timeoutMs: CLI_TIMEOUT_MS, fetch: deps.fetch })
     event('launcher.started')
+    // The agent's home (agent home sync design 0.1.9 § 3.4): pulled before a session starts, pushed each tick while it
+    // runs, released on a clean end. `homeOff`: cmdr.mc had no agent homes at this session's start (an older one, 404,
+    // or switched off, 503 home-unavailable); asked again at every start (design 0.1.15),
+    // so sessions start as before. A lease this machine holds is `leaseId`.
+    const homeCtx: HomeCtx = { client, machine: deps.machine ?? thisMachine(join(deps.userHome, '.cmdr', 'machine.json')), cwd: config.cwd, memoryDir: deps.memoryDir ?? memoryDirOf(config.cwd, deps.env as NodeJS.ProcessEnv), fetch: deps.fetch }
+    let homeOff = false
+    let leaseId: string | null = null
+    let heldSaid = '' // the held-elsewhere stretch, said once
+    const homeUnavailable = (e: unknown) => {
+      const { status, code } = refusalOf(e)
+      return status === 404 || code === 'home-unavailable'
+    }
+    const letGo = async () => {
+      if (!leaseId) return
+      const id = leaseId
+      leaseId = null
+      try {
+        const r = await homeRelease(homeCtx, id)
+        event('launch.home.released', { unpushed: r.unpushed ? 1 : 0 })
+      } catch {
+        event('launch.home.failed', { step: 'release' }) // the lease expires within 5 min
+      }
+    }
     // A session of this agent on the default tmux socket (a launcher from before 0.2.22) is ended once, there only,
     // and the tick starts it again on `-L cmdr`: otherwise the agent would run twice (design 0.2.22, AC-37).
     if ((await deps.run([config.tmux, 'has-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)).code === 0) {
@@ -813,12 +850,31 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
       endedForRestart = false
       let asked: LauncherAction[] = []
       try {
-        asked = await client.actions()
+        asked = await client.actions({ releaseHome: !homeOff })
       } catch {
         return // an older cmdr.mc (404), or unreachable: nothing asked
       }
       for (const a of Array.isArray(asked) ? asked : []) {
         if (typeof a?.id !== 'string') continue
+        if (a.kind === 'release_home') {
+          // A person transferred this agent to another machine (§ 3.4): its turn ends (at most 90 s), the session stops,
+          // the home is pushed and released, and this launcher stays released until a person starts it here again.
+          // cmdr.mc closes the action itself when the lease is released.
+          if (await hasSession(deps, config.tmux, name)) {
+            for (const end = now() + RELEASE_TURN_MS; now() < end; ) {
+              const cap = await deps.run([...tmuxOn(config.tmux), 'capture-pane', '-p', '-t', `=${name}:`], TMUX_TIMEOUT_MS)
+              if (cap.code !== 0 || idleAtInput(cap.stdout)) break
+              await sleep(1000)
+            }
+            await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+            event('launch.session.ended', { reason: 'stopped' })
+            save(ended(readStateFile(dir), now(), 'stopped'))
+            wasUp = false
+          }
+          await letGo()
+          writeStateFile(dir, { ...readStateFile(dir), stopped: true, stoppedReason: 'home-released' })
+          continue
+        }
         const stale = typeof a.stale === 'boolean' ? a.stale : !(Date.parse(a.createdAt) > now() - RESTART_FRESH_MS)
         const close = (status: 'done' | 'failed', detail?: string) => client.actionDone(a.id, status, detail).catch(() => undefined)
         if (stale) {
@@ -861,6 +917,52 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
         st = save(ended(st, now(), reason))
       }
       wasUp = up
+      // The home (§ 3.4): renewed and pushed each tick while the session runs; let go once it's stopped.
+      if (!homeOff && leaseId && up && !st.stopped) {
+        try {
+          // Renews it (5 min); refused if it was forced away. Its answer is used (H725-2): a lease that expired (a Mac
+          // asleep over 5 min) comes back as a NEW lease for this machine. If the home is still where this machine left
+          // it, push on under the new id; if another machine changed it in between, stop and start again, so the pull
+          // sets this machine's unpushed changes aside rather than pushing over the other machine's.
+          const renewed = await client.homeLease(homeCtx.machine)
+          if (renewed.leaseId !== leaseId) {
+            const m = await client.homeManifest(homeCtx.machine.machineId)
+            if (m.revision !== readHomeState(homeCtx.cwd).revision) {
+              leaseId = renewed.leaseId
+              await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+              event('launch.session.ended', { reason: 'exited' })
+              st = save(ended(readStateFile(dir), now(), 'exited'))
+              wasUp = false
+              return
+            }
+            leaseId = renewed.leaseId
+          }
+          const r = await homePush(homeCtx, leaseId)
+          if (r.committed) event('launch.home.pushed', { put: r.put, deleted: r.deleted })
+        } catch (e) {
+          if (e instanceof LeaseLost || refusalOf(e).code === 'lease-held') {
+            // Forced away (a transfer): the session stops here; its last changes are kept by cmdr.mc, unmerged.
+            leaseId = null
+            await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+            event('launch.session.ended', { reason: 'stopped' })
+            st = save(ended(readStateFile(dir), now(), 'stopped'))
+            wasUp = false
+            event('launch.home.held-elsewhere')
+            return
+          }
+          if (e instanceof HomeMoved) {
+            // Another machine changed the home while this one's lease had lapsed (H725-5): stop, and start again
+            // through a pull, which sets this machine's changes aside rather than pushing over the other's.
+            await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+            event('launch.session.ended', { reason: 'exited' })
+            st = save(ended(readStateFile(dir), now(), 'exited'))
+            wasUp = false
+            return
+          }
+          event('launch.home.failed', { step: 'push' }) // next tick
+        }
+      }
+      if (leaseId && !up && st.stopped) await letGo()
       // A session up but not yet heard from since it started (one adopted at a daemon start, or a question that came
       // late) gets one look per tick.
       if (up && !st.stopped && !heardSince(home, st.lastStartAt)) await answerPrompts(deps, config, name, event, 0, now, sleep, asked)
@@ -968,6 +1070,40 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
         stretch = `${said.tag}:${said.fields.reason}`
       }
       if (v.action !== 'start') return
+      // Never start without the home (§ 3.4): take the lease and pull first. Held elsewhere: no session, said once.
+      // Any other failure: no session this tick (starting without it would fork the home). Agent homes off (design
+      // 0.1.15: 503 home-unavailable, or a 404 from a cmdr.mc without them): the session starts without syncing,
+      // state.json says `homeSync: off`, and every later start asks again.
+      {
+        try {
+          const pulled = await homePull(homeCtx)
+          leaseId = pulled.leaseId
+          heldSaid = ''
+          homeOff = false
+          if (readStateFile(dir).heldBy || readStateFile(dir).homeSync) {
+            const { heldBy: _gone, homeSync: _off, ...rest } = readStateFile(dir)
+            writeStateFile(dir, rest)
+          }
+          event('launch.home.pulled', { fetched: pulled.fetched, deleted: pulled.deleted, conflicts: pulled.conflicts })
+          st = { ...readStateFile(dir), lastStartAt: st.lastStartAt }
+        } catch (e) {
+          if (homeUnavailable(e)) {
+            homeOff = true
+            leaseId = null
+            if (readStateFile(dir).homeSync !== 'off') writeStateFile(dir, { ...readStateFile(dir), homeSync: 'off' })
+            st = { ...readStateFile(dir), lastStartAt: st.lastStartAt } // so the start below keeps the mark
+          } else {
+            const r = refusalOf(e)
+            if (r.code === 'lease-held') {
+              const by = typeof r.detail?.machineName === 'string' ? r.detail.machineName : 'another machine'
+              writeStateFile(dir, { ...readStateFile(dir), heldBy: by })
+              if (heldSaid !== by) event('launch.home.held-elsewhere')
+              heldSaid = by
+            } else event('launch.home.failed', { step: 'pull' })
+            return
+          }
+        }
+      }
       st = { ...st, lastStartAt: new Date(now()).toISOString() }
       const spawned = await deps.run([...tmuxOn(config.tmux), 'new-session', '-d', '-s', name, '-c', config.cwd, '--', ...execVia(config, home), 'launch', 'exec', '--home', home], TMUX_TIMEOUT_MS)
       let alive = spawned.code === 0
@@ -1011,8 +1147,9 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
     await lane
     // Leaving for an update: the session stays up for the new daemon to adopt (step 1); the unit restarts on 75.
     if (updated) return EXIT_UPDATED
-    // The session dies with its supervisor (design § 3.3, AC-27).
+    // The session dies with its supervisor (design § 3.3, AC-27), and the home is pushed and let go (§ 3.4).
     await deps.run([...tmuxOn(config.tmux), 'kill-session', '-t', `=${name}`], TMUX_TIMEOUT_MS)
+    await letGo()
     event('launcher.stopped')
     return 0
   } finally {
