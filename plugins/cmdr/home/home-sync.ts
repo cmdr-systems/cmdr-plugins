@@ -10,7 +10,7 @@
 //            S's revision; a lost answer converges through revision-moved (PL-1, H-18)
 //   release  push, then let the lease go
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, relative, sep } from 'node:path'
 import { refusalOf, type HomeEntry, type HomeManifest, type McClient } from '../agent-client/client.js'
@@ -104,11 +104,14 @@ export function walk(ctx: Pick<Ctx, 'cwd' | 'memoryDir'>): Map<string, string> {
       const abs = join(base, n)
       let st
       try {
-        st = statSync(abs, { throwIfNoEntry: false })
+        // lstat, never stat: a symbolic link is never followed (design 0.1.23). A link out of the home (a box's
+        // `.claude/activity/handoffs/<agent>` into the shared workspace) is not the home's, and a pull that moved a file
+        // behind one would cross a mount (EXDEV) and stop halfway.
+        st = lstatSync(abs, { throwIfNoEntry: false })
       } catch {
         continue
       }
-      if (!st) continue
+      if (!st || st.isSymbolicLink()) continue
       const rel = `${prefix}${relative(root, abs).split(sep).join('/')}`
       if (st.isDirectory()) {
         // Prune early: an excluded directory isn't walked at all.
@@ -120,6 +123,38 @@ export function walk(ctx: Pick<Ctx, 'cwd' | 'memoryDir'>): Map<string, string> {
   visit(ctx.cwd, ctx.cwd, 'files/', false)
   visit(ctx.memoryDir, ctx.memoryDir, 'memory/', false)
   return out
+}
+
+/** Whether reaching a home path on this machine goes through a symbolic link (design 0.1.23): such a path is never the home's,
+ * so a pull never writes, deletes or sets it aside, whatever the manifest or `.home-state` says. */
+export function throughLink(ctx: Pick<Ctx, 'cwd' | 'memoryDir'>, path: string): boolean {
+  const memory = path.startsWith('memory/')
+  const segs = path.slice(memory ? 7 : 6).split('/')
+  let at = memory ? ctx.memoryDir : ctx.cwd
+  for (const seg of segs) {
+    at = join(at, seg)
+    const st = lstatSync(at, { throwIfNoEntry: false })
+    if (!st) return false
+    if (st.isSymbolicLink()) return true
+  }
+  return false
+}
+
+/** Moves a file, across a mount if it must (EXDEV: copy, then remove), so a set-aside never fails halfway (design 0.1.23). */
+export function moveFile(from: string, to: string, rename: (a: string, b: string) => void = renameSync) {
+  mkdirSync(dirname(to), { recursive: true })
+  try {
+    rename(from, to)
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EXDEV') throw e
+    copyFileSync(from, to)
+    // Checked before the original goes: a short or failed copy never costs the file.
+    if (md5Of(readFileSync(to)) !== md5Of(readFileSync(from))) {
+      rmSync(to, { force: true })
+      throw new Error('move-copy-mismatch')
+    }
+    rmSync(from)
+  }
 }
 
 /** Where a home path lives on this machine. */
@@ -187,38 +222,56 @@ export async function pull(ctx: Ctx): Promise<Pulled & { leaseId: string }> {
   // A path the home set excludes is never applied, whatever the manifest or `.home-state` says (design 0.1.22 § 3.1):
   // an entry committed before its rule existed (a box's `files/.cmdr/machine.json`) is not written here, and the next
   // push deletes it from the manifest. Never written means never a machine id or a cache swapped under a running start.
-  const applies = (p: string) => { const v = inHome(p, { size: 0 }); return v !== 'excluded' && v !== 'invalid' }
+  const applies = (p: string) => { const v = inHome(p, { size: 0 }); return v !== 'excluded' && v !== 'invalid' && !throughLink(ctx, p) }
   const paths = new Set([...L.keys(), ...Object.keys(S), ...M.keys()].filter(applies))
   const stamp = (ctx.now?.() ?? new Date()).toISOString().replace(/[:.]/g, '-')
   const toFetch: { path: string; md5: string }[] = []
   const out: Pulled = { revision: m.revision, fetched: 0, deleted: 0, conflicts: 0, bytes: 0 }
-  for (const path of paths) {
-    const d = decide(L.get(path) ?? null, S[path] ?? null, M.get(path) ?? null)
-    if (d === 'keep') continue
-    const here = localPath(ctx, path)
-    if (d.startsWith('conflict')) {
-      // The local version goes aside first, never lost and never pushed (`.home-conflicts/` is outside the home set).
-      const aside = join(ctx.cwd, CONFLICTS_DIR, stamp, ...path.split('/'))
-      mkdirSync(dirname(aside), { recursive: true })
-      renameSync(here, aside)
-      out.conflicts += 1
+  // Every file set aside, so a pull that fails before it's done puts back each one nothing replaced (design 0.1.23): a failed
+  // pull leaves the home as it found it, never without the files it had only begun to swap.
+  const moved: [string, string][] = []
+  // Design 0.1.23's order: set aside, then download, then delete, and `.home-state` only at the end.
+  const toDelete: string[] = []
+  try {
+    for (const path of paths) {
+      const d = decide(L.get(path) ?? null, S[path] ?? null, M.get(path) ?? null)
+      if (d === 'keep') continue
+      const here = localPath(ctx, path)
+      if (d.startsWith('conflict')) {
+        // The local version goes aside first, never lost and never pushed (`.home-conflicts/` is outside the home set).
+        const aside = join(ctx.cwd, CONFLICTS_DIR, stamp, ...path.split('/'))
+        moveFile(here, aside)
+        moved.push([here, aside])
+        out.conflicts += 1
+      }
+      if (d === 'fetch' || d === 'conflict-then-fetch') toFetch.push({ path, md5: M.get(path)! })
+      else if (d === 'delete') toDelete.push(here)
     }
-    if (d === 'fetch' || d === 'conflict-then-fetch') toFetch.push({ path, md5: M.get(path)! })
-    else if (d === 'delete' && existsSync(here)) {
+    const md5s = [...new Set(toFetch.map((f) => f.md5))]
+    for (let i = 0; i < md5s.length; i += BATCH) {
+      const links = await ctx.client.homeLinks(ctx.machine.machineId, { leaseId: lease.leaseId, read: md5s.slice(i, i + BATCH) })
+      const got = new Map<string, Uint8Array>()
+      for (const md5 of md5s.slice(i, i + BATCH)) got.set(md5, await download(ctx, links.read[md5]!, md5))
+      for (const f of toFetch.filter((x) => got.has(x.md5))) {
+        writeAtomic(localPath(ctx, f.path), got.get(f.md5)!)
+        out.fetched += 1
+        out.bytes += got.get(f.md5)!.length
+      }
+    }
+    for (const here of toDelete) {
+      if (!existsSync(here)) continue
       rmSync(here)
       out.deleted += 1
     }
-  }
-  const md5s = [...new Set(toFetch.map((f) => f.md5))]
-  for (let i = 0; i < md5s.length; i += BATCH) {
-    const links = await ctx.client.homeLinks(ctx.machine.machineId, { leaseId: lease.leaseId, read: md5s.slice(i, i + BATCH) })
-    const got = new Map<string, Uint8Array>()
-    for (const md5 of md5s.slice(i, i + BATCH)) got.set(md5, await download(ctx, links.read[md5]!, md5))
-    for (const f of toFetch.filter((x) => got.has(x.md5))) {
-      writeAtomic(localPath(ctx, f.path), got.get(f.md5)!)
-      out.fetched += 1
-      out.bytes += got.get(f.md5)!.length
+  } catch (e) {
+    for (const [here, aside] of moved.reverse()) {
+      try {
+        if (!existsSync(here) && existsSync(aside)) moveFile(aside, here)
+      } catch {
+        /* left in .home-conflicts: never lost */
+      }
     }
+    throw e
   }
   writeState(ctx.cwd, m, lease.leaseId)
   return { ...out, leaseId: lease.leaseId }
@@ -262,7 +315,9 @@ export async function push(ctx: Ctx, leaseId: string): Promise<Pushed> {
   const local = walk(ctx)
   const changed: { path: string; abs: string }[] = []
   for (const [p, abs] of local) changed.push({ path: p, abs })
-  const del = Object.keys(state.entries).filter((p) => !local.has(p))
+  // A path behind a symbolic link on this machine is off limits here (design 0.1.23): never uploaded (walk skips it) and
+  // never deleted from the home either, since it may be a real file on another machine.
+  const del = Object.keys(state.entries).filter((p) => !local.has(p) && !throughLink(ctx, p))
   // Read each candidate once: its bytes are what is hashed and what is uploaded (never two readings, R862-1).
   const put: (HomeEntry & { bytes: Uint8Array })[] = []
   let bytes = 0
