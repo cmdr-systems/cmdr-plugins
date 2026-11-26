@@ -517,36 +517,51 @@ const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<
     const home = await import('../home/home-sync.js')
     const m = p.opt['machine-file'] ? machine(p.opt['machine-file']) : machine()
     const hctx = { client: ctx.client, machine: m, cwd, memoryDir: home.memoryDirOf(cwd, ctx.deps.env as NodeJS.ProcessEnv), fetch: ctx.deps.fetch }
-    if (step === 'pull') {
-      const r = await home.pull(hctx)
-      ctx.deps.out(`pulled: revision ${r.revision}, ${r.fetched} fetched, ${r.deleted} deleted, ${r.conflicts} set aside`)
-      return
+    // Agent homes off (design 0.1.15, F897-1): a cmdr.mc without them (404) or with them switched off (503
+    // home-unavailable) is the launcher's rule here too. Nothing is touched and the step exits 0, so the unit's
+    // ExecStartPre starts the agent as before instead of retrying and failing the start.
+    const { refusalOf } = await import('../agent-client/client.js')
+    try {
+      await homeStep(step!, home, hctx, m, ctx)
+    } catch (e) {
+      if (e instanceof home.HomeMoved) throw e
+      const { status, code } = refusalOf(e)
+      if (status !== 404 && code !== 'home-unavailable') throw e
+      ctx.deps.out(`home sync off: cmdr.mc has no agent homes (${code ?? status}); nothing ${step === 'pull' ? 'pulled' : step === 'push' ? 'pushed' : 'released'}`)
     }
-    const { leaseId } = await ctx.client.homeLease(m)
-    if (step === 'push') {
-      let r
-      try {
-        r = await home.push(hctx, leaseId)
-      } catch (e) {
-        if (!(e instanceof home.HomeMoved)) throw e
-        // The home moved while this box didn't hold it (H725-5). A pull never runs under a live session (design 0.1.17,
-        // H-23): nothing is pushed, and the exit code (HOME_MOVED_EXIT) asks the push timer's privileged post step to
-        // restart the agent's unit, whose ExecStopPost releases and ExecStartPre pulls.
-        ctx.deps.out('home moved: nothing pushed; the agent restarts so its start pulls')
-        throw e
-      }
-      let put = r.put
-      let deleted = r.deleted
-      while (r.more) {
-        r = await home.push(hctx, leaseId)
-        put += r.put
-        deleted += r.deleted
-      }
-      ctx.deps.out(`pushed: ${put} changed, ${deleted} deleted`)
-      return
-    }
-    const r = await home.release(hctx, leaseId)
-    ctx.deps.out(`released${r.pushed ? `: ${r.pushed.put} changed, ${r.pushed.deleted} deleted` : ''}`)
   },
+}
+
+async function homeStep(step: string, home: typeof import('../home/home-sync.js'), hctx: import('../home/home-sync.js').Ctx, m: import('../home/machine.js').Machine, ctx: { client: McClient; deps: { out: (l: string) => void } }): Promise<void> {
+  if (step === 'pull') {
+    const r = await home.pull(hctx)
+    ctx.deps.out(`pulled: revision ${r.revision}, ${r.fetched} fetched, ${r.deleted} deleted, ${r.conflicts} set aside`)
+    return
+  }
+  const { leaseId } = await ctx.client.homeLease(m)
+  if (step === 'push') {
+    let r
+    try {
+      r = await home.push(hctx, leaseId)
+    } catch (e) {
+      if (!(e instanceof home.HomeMoved)) throw e
+      // The home moved while this box didn't hold it (H725-5). A pull never runs under a live session (design 0.1.17,
+      // H-23): nothing is pushed, and the exit code (HOME_MOVED_EXIT) asks the push timer's privileged post step to
+      // restart the agent's unit, whose ExecStopPost releases and ExecStartPre pulls.
+      ctx.deps.out('home moved: nothing pushed; the agent restarts so its start pulls')
+      throw e
+    }
+    let put = r.put
+    let deleted = r.deleted
+    while (r.more) {
+      r = await home.push(hctx, leaseId)
+      put += r.put
+      deleted += r.deleted
+    }
+    ctx.deps.out(`pushed: ${put} changed, ${deleted} deleted`)
+    return
+  }
+  const r = await home.release(hctx, leaseId)
+  ctx.deps.out(`released${r.pushed ? `: ${r.pushed.put} changed, ${r.pushed.deleted} deleted` : ''}`)
 }
 
