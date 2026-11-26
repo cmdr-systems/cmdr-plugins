@@ -61,6 +61,9 @@ export function decide(L: string | null, S: string | null, M: string | null): De
   // Changed locally since the last sync (or never synced).
   if (L === M) return 'keep'
   if (L === null) return M === null ? 'keep' : 'fetch'
+  // Never synced and not in the home (design 0.1.24): kept, and the next push adds it. A box pushes at most
+  // PUSH_FILES_PER_TICK a tick, so its backlog is exactly these files; setting them aside at each start emptied the home.
+  if (S === null && M === null) return 'keep'
   return M === null ? 'conflict-then-delete' : 'conflict-then-fetch'
 }
 
