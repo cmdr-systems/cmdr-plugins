@@ -387,11 +387,14 @@ const aliveByKill = (pid: number): boolean => {
     return (e as NodeJS.ErrnoException).code === 'EPERM'
   }
 }
-/** The live holder of the agent's main session directory, or null when none holds it (nobody written down, or its
- *  process is gone). */
+/** The live holder of the agent's main session directory, or null when none holds it (nobody written down, or both
+ *  its processes are gone). Live iff its plugin (`server`, the process that holds the flock) or its `claude` (`pid`,
+ *  which may take seconds to exit after its pane is gone) lives: design 0.1.9 § 3 F-5, R729-1. Read from the holder
+ *  file only: the lock itself is never taken to test it, since that could refuse the very session a restart waits for. */
 export function liveHolder(home: string, deps: LaunchDeps): Holder | null {
   const h = (deps.holder ?? readHolderFile)(join(home, 'sessions', 'main'))
-  return h && (deps.alive ?? aliveByKill)(h.pid) ? h : null
+  const alive = deps.alive ?? aliveByKill
+  return h && (alive(h.server) || alive(h.pid)) ? h : null
 }
 /** Waits up to `ms` for the directory to be let go: null once it is, else the holder still there. Never kills it: the
  *  holder may be a person's own `claude` in that folder (LOCAL-AGENTS-41). */
@@ -1110,7 +1113,7 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
       // started now would only stand down (Ylis, 2026-11-25). Wait for it; past the wait, start nothing and say so.
       const held = await holderReleased(home, deps)
       if (held) {
-        event('launch.restart.blocked', { reason: 'state-dir-held', pid: String(held.pid), session: held.session ?? 'none' })
+        event('launch.restart.blocked', { reason: 'state-dir-held', pid: String(held.pid), server: String(held.server), session: held.session ?? 'none' })
         stretch = null
         return
       }
@@ -1304,7 +1307,7 @@ async function restart(o: Opts, deps: LaunchDeps) {
   const ok = !!h && h.pid !== before?.pid
   eventTo(deps, dir, now)('launch.restart', { source, outcome: ok ? 'restarted' : 'restart-incomplete', waitedMs: String(now() - t0) })
   if (ok) return deps.out(`restarted: ${sessionOf(config!, readStateFile(dir))} started fresh`)
-  if (h) refuse('restart-incomplete', `state-dir held by pid ${h.pid} (session ${h.session ?? 'unknown'})`)
+  if (h) refuse('restart-incomplete', `state-dir held by server ${h.server} (pid ${h.pid}, session ${h.session ?? 'unknown'})`)
   refuse('restart-incomplete', `no session holds the state dir after ${Math.round((RESTART_WAIT_MS + TICK_MS) / 1000)}s`)
 }
 
