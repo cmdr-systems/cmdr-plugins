@@ -163,10 +163,19 @@ async function download(ctx: Ctx, url: string, md5: string): Promise<Uint8Array>
 
 export type Pulled = { revision: number; fetched: number; deleted: number; conflicts: number; bytes: number }
 
-/** Takes the lease (or throws its refusal) and makes the local home the manifest (I-7). Never pushes. */
+/** Takes the lease (or throws its refusal) and makes the local home the manifest (I-7), except a home never committed,
+ * which this machine seeds (H-26). Never pushes. */
 export async function pull(ctx: Ctx): Promise<Pulled & { leaseId: string }> {
   const lease = await ctx.client.homeLease(ctx.machine)
   const m = await ctx.client.homeManifest(ctx.machine.machineId)
+  // A home never committed (revision 0) is seeded from this machine, not applied to it (design 0.1.21 § 3.4, H-26): every local file is
+  // kept, nothing is moved or deleted, and the first push commits them all as revision 1. Applying an empty manifest
+  // would set the whole of an existing agent's home aside on its first sync. Another machine seeding at the same time
+  // can't also win: the lease is one-holder, and a commit from revision 0 meets revision-moved once one has landed.
+  if (m.revision === 0) {
+    writeState(ctx.cwd, m, lease.leaseId)
+    return { revision: 0, fetched: 0, deleted: 0, conflicts: 0, bytes: 0, leaseId: lease.leaseId }
+  }
   const S = readState(ctx.cwd).entries
   const M = new Map(m.entries.map((e) => [e.path, e.md5]))
   const local = walk(ctx)
