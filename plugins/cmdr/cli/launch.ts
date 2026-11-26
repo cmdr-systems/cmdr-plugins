@@ -19,7 +19,7 @@ import { ACTIVITY_STATE_FILE, McClient, Mode } from '../agent-client/index.js'
 import { refusalOf, type LauncherAction } from '../agent-client/client.js'
 import { HomeMoved, LeaseLost, memoryDirOf, pull as homePull, push as homePush, readState as readHomeState, release as homeRelease, type Ctx as HomeCtx } from '../home/home-sync.js'
 import { machine as thisMachine, type Machine } from '../home/machine.js'
-import { flockExclusive, type Lock } from '../state-dir.js'
+import { flockExclusive, readHolderFile, type Holder, type Lock } from '../state-dir.js'
 import { CLI_TIMEOUT_MS, parseArgs, RETRY_AFTER_MS } from './main.js'
 
 /** The home's `config.json` (design § 3.1): never the key, no timestamp (the file's mtime says when). */
@@ -82,13 +82,17 @@ export const TMUX_TIMEOUT_MS = 5_000
 export const SPAWN_DEADLINE_MS = 5_000
 /** launchctl / systemctl (plan § 4). */
 export const SERVICE_TIMEOUT_MS = 10_000
+/** How long a start waits for the session before it to let go of the agent's state directory, and how often it looks
+ *  (reconnect-after-rollout design 0.1.8 § 3 F-5): past it, no session is started, said, and tried again next tick. */
+export const RESTART_WAIT_MS = 30_000
+export const HOLDER_POLL_MS = 500
 /** The tmux floor (design § 3.1, § 5, LS-13): `new-session`'s command as several arguments. */
 export const TMUX_FLOOR = { major: 2, minor: 0 } as const
 
 // ── the pure core ──────────────────────────────────────────────────────
 
 /** The closed event set (design 0.2.3 § 6). */
-export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed', 'launch.session.channel-reconnect', 'launch.session.channel-missing', 'launch.restart', 'launch.restart.stale', 'launch.home.pulled', 'launch.home.pushed', 'launch.home.held-elsewhere', 'launch.home.released', 'launch.home.failed'] as const
+export const LAUNCH_EVENTS = ['launcher.started', 'launcher.refused', 'launch.session.started', 'launch.session.skipped', 'launch.session.failed', 'launch.session.ended', 'launcher.marked', 'launcher.stopped', 'launch.session.prompt-answered', 'launch.session.prompt-waiting', 'launcher.cwd-changed', 'launcher.updated', 'launcher.session-moved', 'launcher.session-renamed', 'launch.session.channel-reconnect', 'launch.session.channel-missing', 'launch.restart', 'launch.restart.stale', 'launch.restart.blocked', 'launch.home.pulled', 'launch.home.pushed', 'launch.home.held-elsewhere', 'launch.home.released', 'launch.home.failed'] as const
 export type LaunchEvent = (typeof LAUNCH_EVENTS)[number]
 
 /** What a field of an event may hold: a reason, a state word. Never a message's text (design § 6, AC-12). */
@@ -369,6 +373,38 @@ export type LaunchDeps = {
   machine?: Machine
   /** The agent's Claude Code memory folder for its cwd (§ 3.2); tests give one. */
   memoryDir?: string
+  /** the session holding a state directory, as it wrote itself down (state-dir.ts), or null */
+  holder?: (dir: string) => Holder | null
+  /** whether a process lives (kill(pid, 0)); EPERM counts as alive */
+  alive?: (pid: number) => boolean
+}
+
+const aliveByKill = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+/** The live holder of the agent's main session directory, or null when none holds it (nobody written down, or its
+ *  process is gone). */
+export function liveHolder(home: string, deps: LaunchDeps): Holder | null {
+  const h = (deps.holder ?? readHolderFile)(join(home, 'sessions', 'main'))
+  return h && (deps.alive ?? aliveByKill)(h.pid) ? h : null
+}
+/** Waits up to `ms` for the directory to be let go: null once it is, else the holder still there. Never kills it: the
+ *  holder may be a person's own `claude` in that folder (LOCAL-AGENTS-41). */
+export async function holderReleased(home: string, deps: LaunchDeps, ms = RESTART_WAIT_MS, except?: number): Promise<Holder | null> {
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? ((t: number) => new Promise<void>((r) => setTimeout(r, t)))
+  const end = now() + ms
+  for (;;) {
+    const h = liveHolder(home, deps)
+    if (!h || h.pid === except) return null
+    if (now() >= end) return h
+    await sleep(HOLDER_POLL_MS)
+  }
 }
 
 /** A refusal: `refused: <reason>[: <detail>]` on stderr, exit 1 (as every verb, design § 3.1). */
@@ -1070,6 +1106,14 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
         stretch = `${said.tag}:${said.fields.reason}`
       }
       if (v.action !== 'start') return
+      // The session before may still hold the state directory for a few seconds after its pane is gone: a session
+      // started now would only stand down (Ylis, 2026-11-25). Wait for it; past the wait, start nothing and say so.
+      const held = await holderReleased(home, deps)
+      if (held) {
+        event('launch.restart.blocked', { reason: 'state-dir-held', pid: String(held.pid), session: held.session ?? 'none' })
+        stretch = null
+        return
+      }
       // Never start without the home (§ 3.4): take the lease and pull first. Held elsewhere: no session, said once.
       // Any other failure: no session this tick (starting without it would fork the home). Agent homes off (design
       // 0.1.15: 503 home-unavailable, or a 404 from a cmdr.mc without them): the session starts without syncing,
@@ -1243,11 +1287,25 @@ async function restart(o: Opts, deps: LaunchDeps) {
   if (readStateFile(dir).stopped) refuse('stopped', `the agent is stopped: ${wrapperOf(home)} launch start --home ${home} starts it`)
   const unit = unitOf(deps, home)
   if (!unit) refuse('launcher-not-installed', `no login service for ${home}: set the agent up on this machine again`)
+  const before = liveHolder(home, deps)
   const cmd = deps.platform === 'darwin' ? ['launchctl', 'kickstart', '-k', `gui/${deps.uid}/${unit!.label}`] : ['systemctl', '--user', 'restart', `${unit!.label}.service`]
   const p = await deps.run(cmd, SERVICE_TIMEOUT_MS)
   if (p.code !== 0) refuse('service-failed', firstLine(p))
-  eventTo(deps, dir, deps.now ?? Date.now)('launch.restart', { source })
-  deps.out(`restarted: ${sessionOf(config!, readStateFile(dir))} starts fresh`)
+  // Restarted means a new session holds the agent's state directory, not that the unit restarted (design 0.1.8 § 3
+  // F-5): waited for up to the start's own wait and one tick.
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? ((t: number) => new Promise<void>((r) => setTimeout(r, t)))
+  const t0 = now()
+  let h = liveHolder(home, deps)
+  while (!(h && h.pid !== before?.pid) && now() - t0 < RESTART_WAIT_MS + TICK_MS) {
+    await sleep(HOLDER_POLL_MS)
+    h = liveHolder(home, deps)
+  }
+  const ok = !!h && h.pid !== before?.pid
+  eventTo(deps, dir, now)('launch.restart', { source, outcome: ok ? 'restarted' : 'restart-incomplete', waitedMs: String(now() - t0) })
+  if (ok) return deps.out(`restarted: ${sessionOf(config!, readStateFile(dir))} started fresh`)
+  if (h) refuse('restart-incomplete', `state-dir held by pid ${h.pid} (session ${h.session ?? 'unknown'})`)
+  refuse('restart-incomplete', `no session holds the state dir after ${Math.round((RESTART_WAIT_MS + TICK_MS) / 1000)}s`)
 }
 
 function start(o: Opts, deps: LaunchDeps) {
