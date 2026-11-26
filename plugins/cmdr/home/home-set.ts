@@ -18,8 +18,12 @@ export const MAX_FILE = 20 * 1024 * 1024;
 export const MAX_HOME = 500 * 1024 * 1024;
 const MAX_PATH_BYTES = 512;
 
-/** Directories never synced, at any depth. `.home-conflicts` is the pull's own (§ 3.4). */
-const EXCLUDED_DIRS = new Set(['.git', 'node_modules', '.venv', 'dist', 'build', '.cache', '.home-conflicts']);
+/**
+ * Directories never synced, at any depth. `.home-conflicts` is the pull's own (§ 3.4). `.cmdr` is the machine's
+ * identity and launcher state (design 0.1.22): on a box the working directory is HOME, so `files/.cmdr/machine.json`
+ * would otherwise travel. `.bun`, `.npm` and `.pnpm-store` are package caches.
+ */
+const EXCLUDED_DIRS = new Set(['.git', 'node_modules', '.venv', 'dist', 'build', '.cache', '.home-conflicts', '.cmdr', '.bun', '.npm', '.pnpm-store']);
 /** Files never synced: the launcher's own state. */
 const EXCLUDED_FILES = new Set(['.home-state']);
 /** Secret patterns on a file's name (§ 3.1). */

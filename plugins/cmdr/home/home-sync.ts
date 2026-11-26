@@ -184,7 +184,11 @@ export async function pull(ctx: Ctx): Promise<Pulled & { leaseId: string }> {
     const h = cachedMd5(abs)
     if (h) L.set(p, h)
   }
-  const paths = new Set([...L.keys(), ...Object.keys(S), ...M.keys()])
+  // A path the home set excludes is never applied, whatever the manifest or `.home-state` says (design 0.1.22 § 3.1):
+  // an entry committed before its rule existed (a box's `files/.cmdr/machine.json`) is not written here, and the next
+  // push deletes it from the manifest. Never written means never a machine id or a cache swapped under a running start.
+  const applies = (p: string) => { const v = inHome(p, { size: 0 }); return v !== 'excluded' && v !== 'invalid' }
+  const paths = new Set([...L.keys(), ...Object.keys(S), ...M.keys()].filter(applies))
   const stamp = (ctx.now?.() ?? new Date()).toISOString().replace(/[:.]/g, '-')
   const toFetch: { path: string; md5: string }[] = []
   const out: Pulled = { revision: m.revision, fetched: 0, deleted: 0, conflicts: 0, bytes: 0 }

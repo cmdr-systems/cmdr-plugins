@@ -1,5 +1,5 @@
 {
-  "about": "agent home sync design 0.1.8 § 3.1: the cases both repos' home-set rules must pass (cmdr.mono services/cmdr.mc/src/modules/agent-home, cmdr.crew core/modules/channels/cmdr/home). Byte for byte the same file in both; cmdr.crew's parity test reads cmdr.mono's at main.",
+  "about": "agent home sync design 0.1.22 § 3.1: the cases both repos' home-set rules must pass (cmdr.mono services/cmdr.mc/src/modules/agent-home, cmdr.crew core/modules/channels/cmdr/home). Byte for byte the same file in both; cmdr.crew's parity test reads cmdr.mono's at main.",
   "cases": [
     { "path": "memory/MEMORY.md", "size": 812, "verdict": "ok" },
     { "path": "memory/notes/plan.md", "size": 2048, "verdict": "ok" },
@@ -26,6 +26,12 @@
     { "path": "files/repo/README.md", "size": 10, "gitDir": true, "verdict": "excluded" },
     { "path": "files/.home-conflicts/2026-11-25T21:00Z/notes.md", "size": 10, "verdict": "excluded" },
     { "path": "files/.home-state", "size": 10, "verdict": "excluded" },
+    { "path": "files/.cmdr/machine.json", "size": 90, "verdict": "excluded" },
+    { "path": "files/work/.cmdr/agents/x/state.json", "size": 10, "verdict": "excluded" },
+    { "path": "files/.bun/install/cache/pkg/index.js", "size": 10, "verdict": "excluded" },
+    { "path": "files/.npm/_cacache/index-v5/x", "size": 10, "verdict": "excluded" },
+    { "path": "files/.pnpm-store/v3/files/x", "size": 10, "verdict": "excluded" },
+    { "path": "files/notes/.cmdr-notes.md", "size": 10, "verdict": "ok" },
     { "path": "files/../x", "size": 10, "verdict": "invalid" },
     { "path": "files/a/../../etc/passwd", "size": 10, "verdict": "invalid" },
     { "path": "/files/x", "size": 10, "verdict": "invalid" },
