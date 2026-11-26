@@ -38,6 +38,7 @@ import { continueGate, type GateVerdict, type MyTask, type Waiting } from './con
 import { modeOf, openerOf, type Mode, type Opener } from './mode.js'
 import { Link, writeLink, type LinkTarget } from './agent-client/link.js'
 import { Session, SessionRefused, type SessionOk, type SessionScope } from './agent-client/session.js'
+import { Backoff, isFinal, refusalName, type Refusal } from './agent-client/reconnect.js'
 import { awaits, isGoAhead, reactionsLine } from './reactions.js'
 
 // ── cmdr.mc ────────────────────────────────────────────────────────────
@@ -311,6 +312,9 @@ export interface SocketLike {
    *  not connected, never queued for later. A compaction about to run (context.ts) waits on it. */
   ask?(event: string, data: unknown, ms: number): Promise<unknown>
   off?(event: string, fn: (...args: any[]) => void): unknown
+  /** Open it again (socket.io's `connect()`): after cmdr.mc's own disconnect, which socket.io never retries by itself
+   *  (reconnect-after-rollout design § 3 F-2). Absent: no reconnect. */
+  connect?(): unknown
 }
 
 
@@ -417,6 +421,8 @@ export interface ChannelDeps {
   wakeMaxAttempts?: number
   /** the clock the wake belt reads (tests inject one) */
   now?(): number
+  /** [0, 1): the reconnect backoff's jitter (design § 3 F-2); Math.random otherwise */
+  rand?(): number
   /** files: moving bytes to and from cmdr.mc (files.ts), and where a message's files are put for the session */
   files?: FileTransport
   inboxDir?: string
@@ -586,11 +592,25 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
   const hears = hearsOf({ me, isQueue, mention })
 
   /** Hand it on if it's for us AND from someone admitted; otherwise it never reaches the session. */
+  // The ids of the last DELIVERED_IDS messages handed to the session, oldest first: written by deliver alone, read by
+  // offer alone (design § 3 F-2b, 0.1.6).
+  const DELIVERED_IDS = 500
+  const delivered = new Set<string>()
+  function remember(id: string) {
+    delivered.delete(id)
+    delivered.add(id)
+    while (delivered.size > DELIVERED_IDS) delivered.delete(delivered.values().next().value!)
+  }
+
   async function offer(c: Conversation, m: Message) {
+    // Delivered already (live, then again by a catch-up retry): once is enough (design § 3 F-2b, 0.1.6).
+    if (delivered.has(m.id)) return
     tellIfNoThreadAgentIds(m)
     if (!hears(c, m)) return
     // The queue's own task news: cmdr.mc wrote it, as the queue.
     const role = m.feed && m.author?.kind === 'agent' && m.author.id === me.id ? 'feed' : await admission.roleOf(m.author)
+    // Asked again after the wait: the same message may have come the other way meanwhile.
+    if (delivered.has(m.id)) return
     if (!role) {
       stamp(`inbound_refused author_kind=${m.author?.kind ?? 'none'}`)
       log(`not admitted: ${m.author?.kind ?? 'unknown'} ${m.author?.id ?? ''} in ${where(c)} (not one of this crew's people)`)
@@ -707,6 +727,7 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
    *  witness fires once the notification resolved: post gate, at the true
    *  delivery instant, never at arrival. */
   function deliver(c: Conversation, m: Message, role: string) {
+    remember(m.id)
     const send = () => {
       // Its files first, into the inbox, listed by path in what the session reads.
       withFiles(m.body, m.id, m.attachments, deps.inboxDir, deps.files, log)
@@ -1921,14 +1942,86 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
 
   // ── catching up (held by the boot gate), then live ───────────────────
 
-  for (const c of await refresh()) {
-    // A feed never wakes us (hears()): nothing to catch up on.
-    if (!c.unread || isFeed(c)) continue
+  // Never the reason the socket doesn't open (design § 3 F-2b): a call that fails is stamped, and tried again once
+  // the socket is in. Before 0.3.13 one failure here ended the start silently, with no socket at all.
+  // conversation id → how long its last refusal asked us to wait (a 429's Retry-After), 0 when it said nothing
+  const catchUpLater = new Map<string, number>()
+  let listLater = false
+  const statusOf = (e: unknown) => (e as { status?: number })?.status ?? 'none'
+  async function catchUp(c: Conversation): Promise<void> {
     const recent = await api<Message[]>(`/agent/conversations/${c.id}/messages?limit=${Math.min(c.unread, 20)}`)
     for (const m of recent) await offer(c, m)
   }
+  async function catchUpAll(): Promise<void> {
+    let all: Conversation[]
+    try {
+      all = await refresh()
+    } catch (e) {
+      listLater = true
+      stamp('catchup_failed list')
+      log(`catching up: reading the conversations failed (${e}); read again once connected`)
+      return
+    }
+    for (const c of all) {
+      // A feed never wakes us (hears()): nothing to catch up on.
+      if (!c.unread || isFeed(c)) continue
+      try {
+        await catchUp(c)
+      } catch (e) {
+        catchUpLater.set(c.id, (e as { retryAfterMs?: number })?.retryAfterMs ?? 0)
+        stamp(`catchup_failed conversation=${c.id} status=${statusOf(e)}`)
+        log(`catching up ${where(c)} failed (${e}); tried again once connected`)
+      }
+    }
+  }
+  await catchUpAll()
 
   const socket = deps.openSocket()
+  // The reconnect after cmdr.mc closes us (design § 3 F-2): the last refusal since this socket last connected, and
+  // the attempts so far.
+  let lastRefusal: Refusal | null = null
+  let reconnecting = 0
+  let stopped = false
+  const backoff = new Backoff(clock, deps.rand ?? Math.random)
+  // What the start couldn't catch up on, once the socket is in: the list first if it failed, then each conversation
+  // with F-2's schedule, a 429 waiting at least its Retry-After. An entry leaves only on success or stop().
+  let retrying = false
+  function retryCatchUp(): void {
+    if (retrying || (!listLater && catchUpLater.size === 0)) return
+    retrying = true
+    void (async () => {
+      if (listLater) {
+        listLater = false
+        await catchUpAll()
+      }
+      await Promise.all([...catchUpLater.keys()].map((id) => retryOne(id, new Backoff(clock, deps.rand ?? Math.random))))
+    })().finally(() => {
+      retrying = false
+    })
+  }
+  async function retryOne(id: string, b: Backoff): Promise<void> {
+    while (!stopped && catchUpLater.has(id)) {
+      // Each try waits its step of F-2's schedule, and at least what the last refusal asked.
+      const wait = Math.max(b.next(), catchUpLater.get(id) ?? 0)
+      stamp(`catchup_retry conversation=${id} in=${wait}`)
+      await new Promise<void>((r) => later(wait, r))
+      if (stopped) return
+      const c = conversations.get(id)
+      if (!c) {
+        catchUpLater.delete(id)
+        return
+      }
+      try {
+        await catchUp(c)
+        catchUpLater.delete(id)
+        stamp(`catchup_retried conversation=${id}`)
+        return
+      } catch (e) {
+        catchUpLater.set(id, (e as { retryAfterMs?: number })?.retryAfterMs ?? 0)
+        stamp(`catchup_failed conversation=${id} status=${statusOf(e)}`)
+      }
+    }
+  }
   declareScope = async (scope) => {
     if (!external || !socket.out) return null
     try {
@@ -2087,6 +2180,12 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
   socket.on('ready', () => {
     log('live')
     stamp(`socket_connected agent=@${me.handle}`)
+    // Back after cmdr.mc closed us: said with how many tries it took (design § 3 F-2, § 6).
+    lastRefusal = null
+    if (reconnecting > 0) stamp(`reconnected after ${reconnecting} attempts`)
+    reconnecting = 0
+    backoff.connected()
+    retryCatchUp()
     heartbeat.arm()
     dispatchWakeAction(wakeGate.observe('socket_connected'))
     // A local session declares what it hears, on every (re)connect: cmdr.mc keeps a scope only while its socket lives
@@ -2115,19 +2214,42 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
     void tell(content, `project-${d.id}`, null, null)
   })
   socket.on('connect_error', (e: Error) => log(`socket: ${e.message}`))
-  // cmdr.mc refuses a connection with `error` and closes it (`session-limit`, a key revoked, payment held): said, and a
-  // local session is told, since a server's disconnect is not retried (S10-1; sessions design § 3.4).
-  socket.on('error', (e: { message?: string } | undefined) => {
-    const why = String(e?.message ?? 'refused')
-    stamp(`server_refused ${why}`)
-    log(`cmdr refused this connection: ${why}`)
-    if (external) sessionNote(why === 'session-limit' ? `cmdr refused this session: session-limit. This agent already has as many live sessions as cmdr allows; end one, then start this one again.` : `cmdr refused this session's connection: ${why}.`, null, null)
+  // The handshake: whatever was refused before belongs to the last socket (design § 3 F-2, D-4).
+  socket.on('connect', () => {
+    lastRefusal = null
+  })
+  // cmdr.mc refuses a connection with `error` and closes it. Only a final refusal (`revoked`, `session-limit`, payment
+  // held, a person's session revoked, too many connections) keeps it closed; anything else is tried again
+  // (reconnect-after-rollout design § 3 F-2, narrowing S10-1). Said either way, and a local session is told.
+  socket.on('error', (e: Refusal | undefined) => {
+    lastRefusal = { code: typeof e?.code === 'string' ? e.code : undefined, message: typeof e?.message === 'string' ? e.message : undefined }
+    const why = refusalName(lastRefusal)
+    const final = isFinal(lastRefusal)
+    stamp(`server_refused ${why}${final ? ' final' : ''}`)
+    log(`cmdr refused this connection: ${why}${final ? '' : '; trying again'}`)
+    if (!external) return
+    if (why === 'session-limit') sessionNote(`cmdr refused this session: session-limit. This agent already has as many live sessions as cmdr allows; end one, then start this one again.`, null, null)
+    else if (final) sessionNote(`cmdr refused this session's connection: ${why}.`, null, null)
+    else sessionNote(`cmdr refused this session's connection for now (${why}); it is trying again.`, null, null)
   })
   socket.on('disconnect', (reason: string) => {
     heartbeat.disarm()
     // cmdr.mc keeps a scope only while its socket lives: a new socket holds none until it declares.
     heldScope = null
     log(`socket closed: ${reason}`)
+    backoff.disconnected()
+    // socket.io reconnects by itself after a lost transport, never after the server's own disconnect: that one is ours.
+    if (reason !== 'io server disconnect' || !socket.connect || stopped) return
+    if (isFinal(lastRefusal)) {
+      log(`not reconnecting: cmdr's refusal (${refusalName(lastRefusal)}) is final`)
+      return
+    }
+    const ms = backoff.next()
+    reconnecting++
+    stamp(`reconnect_scheduled ${ms} reason=${refusalName(lastRefusal)}`)
+    later(ms, () => {
+      if (!stopped) socket.connect!()
+    })
   })
   // One at a time, in arrival order: a message waiting on a conversation
   // lookup or on admission re-reading the crew's people must not be
@@ -2292,6 +2414,7 @@ export async function startChannel(deps: ChannelDeps): Promise<Channel> {
       } else working(a)
     },
     async stop() {
+      stopped = true
       goIdle()
       if (contextTimer) clearTimeout(contextTimer)
       heartbeat.disarm()

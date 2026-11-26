@@ -7,11 +7,15 @@ import { io } from 'socket.io-client'
 import type { Attachment, Author, Conversation, Message, ReactionView } from './types.js'
 import type { Person } from './hearing.js'
 
-/** A cmdr.mc refusal as one line: `<status> <code>: <message>` (the plugin's tools say it as it is). */
-export function apiError(status: number, statusText: string, error?: { message?: string; code?: string }): Error {
-  // The message as before (callers parse `<status> <code>:`); the status, code and the refusal's own fields ride along
-  // for those that need them (agent home: lease-held's machineName).
-  return Object.assign(new Error(`${status} ${error?.code ? `${error.code}: ` : ''}${error?.message ?? statusText}`), { status, code: error?.code ?? null, detail: error ?? null })
+/** An HTTP refusal, as one line `<status> <code>: <message>` (the plugin's tools say it as it is). Its message as before (callers parse `<status> <code>:`); the status, code and the refusal's own
+ *  fields ride along for those that need them (agent home: lease-held's machineName), and from a `Retry-After` header,
+ *  how long to wait (reconnect-after-rollout design § 3 F-2b: a 429's retry honours it). */
+export type ApiError = Error & { status: number; code: string | null; detail: { message?: string; code?: string } | null; retryAfterMs?: number }
+export function apiError(status: number, statusText: string, error?: { message?: string; code?: string }, retryAfter?: string | null): ApiError {
+  const e = Object.assign(new Error(`${status} ${error?.code ? `${error.code}: ` : ''}${error?.message ?? statusText}`), { status, code: error?.code ?? null, detail: error ?? null }) as ApiError
+  const ms = retryAfterMs(retryAfter)
+  if (ms !== undefined) e.retryAfterMs = ms
+  return e
 }
 
 /** A cmdr.mc refusal's status, code and fields, from an error apiError made (else nulls). */
@@ -20,9 +24,17 @@ export function refusalOf(e: unknown): { status: number | null; code: string | n
   return { status: typeof x?.status === 'number' ? x.status : null, code: typeof x?.code === 'string' ? x.code : null, detail: x?.detail && typeof x.detail === 'object' ? (x.detail as Record<string, unknown>) : null }
 }
 
+/** `Retry-After` as delay-seconds or an HTTP date; anything else is no answer. */
+export function retryAfterMs(h: string | null | undefined, now = Date.now()): number | undefined {
+  if (!h) return undefined
+  if (/^\s*\d+\s*$/.test(h)) return Number(h) * 1000
+  const t = Date.parse(h)
+  return Number.isNaN(t) ? undefined : Math.max(0, t - now)
+}
+
 /** This plugin's version, as its package.json says it (tests/agent-client/client.spec.ts holds the two together):
  *  what the MCP server names itself and what the socket declares. */
-export const PLUGIN_VERSION = '0.3.16'
+export const PLUGIN_VERSION = '0.3.17'
 /** What this plugin can do that cmdr.mc must know before it acts (general crew channel design § 3.1, AC-10):
  *  `general-channel`, it knows its crew's general channel and no home, so an organization may archive its role channels. */
 export const GENERAL_CHANNEL_CAPABILITY = 'general-channel'
@@ -70,7 +82,7 @@ export class McClient {
         ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
       })
       const json = (await res.json().catch(() => ({}))) as { success?: boolean; data?: T; error?: { message?: string; code?: string } }
-      if (!res.ok || json.success === false) throw apiError(res.status, res.statusText, json.error)
+      if (!res.ok || json.success === false) throw apiError(res.status, res.statusText, json.error, res.headers?.get?.('retry-after'))
       return (json.data ?? json) as T
     }
   }
