@@ -45,7 +45,7 @@ export const USAGE = `usage: cmdr-agent <verb> [args]
                                        print each message for you as a <channel …> line, until interrupted; it
                                        declares its scope first (main unless told), as a session does
   sessions                             your live sessions: scope, channel, since
-  home pull|push|release --cwd <dir> [--machine-file <path>]
+  home pull|push|release --cwd <dir> [--machine-file <path>] [--deadline <epoch ms>]
                                        the agent's home (agent home sync § 3.4), for a box: pull before a start,
                                        push each round, push and release on a clean stop; prints counts only
   launch install|run|status|stop|start|uninstall …
@@ -507,16 +507,30 @@ const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<
   },
   // The box's half of agent home sync (design 0.1.9 § 2, AC-7, AC-12): the same pull, push and release the Mac
   // launcher runs in-process. Each call takes or renews this machine's lease first (the same machine gets the same
-  // lease back). Prints counts, never a path or content.
+  // lease back). Prints counts, never a path or content. `runsOn` is read once, first (design 0.1.29): it decides the
+  // walk (a box's allowlist), and a platform agent has no home here (`home: none`, exit 0, no lease taken).
+  // `--deadline`: the box's start loop's own end (crew-launch), so a pull says what it left instead of being killed.
   home: async (a, ctx) => {
-    const p = parseArgs(a, ['cwd', 'machine-file'])
+    const p = parseArgs(a, ['cwd', 'machine-file', 'deadline'])
     const step = p.pos[0]
-    if (p.pos.length !== 1 || !['pull', 'push', 'release'].includes(step!)) refuse('usage', 'home pull|push|release --cwd <dir> [--machine-file <path>]')
+    if (p.pos.length !== 1 || !['pull', 'push', 'release'].includes(step!)) refuse('usage', 'home pull|push|release --cwd <dir> [--machine-file <path>] [--deadline <epoch ms>]')
     const cwd = p.opt.cwd ?? refuse('usage', '--cwd <dir>: the agent\'s working directory')
-    const { machine } = await import('../home/machine.js')
+    const deadline = p.opt.deadline === undefined ? undefined : /^\d{1,15}$/.test(p.opt.deadline) ? Number(p.opt.deadline) : refuse('usage', '--deadline <epoch ms>')
     const home = await import('../home/home-sync.js')
+    let runsOn: string | null
+    try {
+      runsOn = await home.readRunsOn(ctx.client)
+    } catch (e) {
+      return refuse('scope-unknown', `/agent/me unanswered (${(e as Error)?.message ?? String(e)})`)
+    }
+    const scope = await home.scopeOf({ client: ctx.client, runsOn }).catch((e: unknown) => refuse('scope-unknown', (e as Error).message.replace(/^scope-unknown: /, '')))
+    if (scope === 'none') {
+      ctx.deps.out('home: none (runsOn platform)')
+      return
+    }
+    const { machine } = await import('../home/machine.js')
     const m = p.opt['machine-file'] ? machine(p.opt['machine-file']) : machine()
-    const hctx = { client: ctx.client, machine: m, cwd, memoryDir: home.memoryDirOf(cwd, ctx.deps.env as NodeJS.ProcessEnv), fetch: ctx.deps.fetch }
+    const hctx = { client: ctx.client, machine: m, cwd, memoryDir: home.memoryDirOf(cwd, ctx.deps.env as NodeJS.ProcessEnv), fetch: ctx.deps.fetch, runsOn, ...(deadline !== undefined ? { deadline } : {}) }
     // Agent homes off (design 0.1.15, F897-1): a cmdr.mc without them (404) or with them switched off (503
     // home-unavailable) is the launcher's rule here too. Nothing is touched and the step exits 0, so the unit's
     // ExecStartPre starts the agent as before instead of retrying and failing the start.
@@ -525,6 +539,11 @@ const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<
       await homeStep(step!, home, hctx, m, ctx)
     } catch (e) {
       if (e instanceof home.HomeMoved) throw e
+      if (e instanceof home.PullIncomplete) {
+        ctx.deps.out(`pull incomplete: ${e.fetched} fetched, ${e.remaining} remaining`)
+        refuse('pull-incomplete', `${e.fetched} fetched, ${e.remaining} remaining`)
+      }
+      if (e instanceof home.HomeScopeUnknown) refuse('scope-unknown', e.message.replace(/^scope-unknown: /, ''))
       const { status, code } = refusalOf(e)
       if (status !== 404 && code !== 'home-unavailable') throw e
       ctx.deps.out(`home sync off: cmdr.mc has no agent homes (${code ?? status}); nothing ${step === 'pull' ? 'pulled' : step === 'push' ? 'pushed' : 'released'}`)
@@ -535,14 +554,17 @@ const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<
 async function homeStep(step: string, home: typeof import('../home/home-sync.js'), hctx: import('../home/home-sync.js').Ctx, m: import('../home/machine.js').Machine, ctx: { client: McClient; deps: { out: (l: string) => void } }): Promise<void> {
   if (step === 'pull') {
     const r = await home.pull(hctx)
+    if ('none' in r) return ctx.deps.out('home: none (runsOn platform)')
     ctx.deps.out(`pulled: revision ${r.revision}, ${r.fetched} fetched, ${r.deleted} deleted, ${r.conflicts} set aside`)
     return
   }
   const { leaseId } = await ctx.client.homeLease(m)
   if (step === 'push') {
-    let r
+    let r: import('../home/home-sync.js').Pushed
     try {
-      r = await home.push(hctx, leaseId)
+      const first = await home.push(hctx, leaseId)
+      if ('none' in first) return ctx.deps.out('home: none (runsOn platform)')
+      r = first
     } catch (e) {
       if (!(e instanceof home.HomeMoved)) throw e
       // The home moved while this box didn't hold it (H725-5). A pull never runs under a live session (design 0.1.17,
@@ -554,7 +576,9 @@ async function homeStep(step: string, home: typeof import('../home/home-sync.js'
     let put = r.put
     let deleted = r.deleted
     while (r.more) {
-      r = await home.push(hctx, leaseId)
+      const next = await home.push(hctx, leaseId)
+      if ('none' in next) break
+      r = next
       put += r.put
       deleted += r.deleted
     }
@@ -562,6 +586,7 @@ async function homeStep(step: string, home: typeof import('../home/home-sync.js'
     return
   }
   const r = await home.release(hctx, leaseId)
+  if ('none' in r) return ctx.deps.out('home: none (runsOn platform)')
   ctx.deps.out(`released${r.pushed ? `: ${r.pushed.put} changed, ${r.pushed.deleted} deleted` : ''}`)
 }
 

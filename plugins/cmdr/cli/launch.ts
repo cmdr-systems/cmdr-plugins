@@ -843,7 +843,7 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
       leaseId = null
       try {
         const r = await homeRelease(homeCtx, id)
-        event('launch.home.released', { unpushed: r.unpushed ? 1 : 0 })
+        event('launch.home.released', { unpushed: 'unpushed' in r && r.unpushed ? 1 : 0 })
       } catch {
         event('launch.home.failed', { step: 'release' }) // the lease expires within 5 min
       }
@@ -977,7 +977,7 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
             leaseId = renewed.leaseId
           }
           const r = await homePush(homeCtx, leaseId)
-          if (r.committed) event('launch.home.pushed', { put: r.put, deleted: r.deleted })
+          if ('committed' in r && r.committed) event('launch.home.pushed', { put: r.put, deleted: r.deleted })
         } catch (e) {
           if (e instanceof LeaseLost || refusalOf(e).code === 'lease-held') {
             // Forced away (a transfer): the session stops here; its last changes are kept by cmdr.mc, unmerged.
@@ -1120,10 +1120,19 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
       // Never start without the home (§ 3.4): take the lease and pull first. Held elsewhere: no session, said once.
       // Any other failure: no session this tick (starting without it would fork the home). Agent homes off (design
       // 0.1.15: 503 home-unavailable, or a 404 from a cmdr.mc without them): the session starts without syncing,
-      // state.json says `homeSync: off`, and every later start asks again.
+      // state.json says `homeSync: off`, and every later start asks again. A platform agent (`runsOn` platform, design
+      // 0.1.29: `{none: true}`) is the same: no home here, nothing touched. Where it runs unknown (`scope-unknown`): a
+      // failed pull, no session this tick.
       {
+        const homeOffNow = () => {
+          homeOff = true
+          leaseId = null
+          if (readStateFile(dir).homeSync !== 'off') writeStateFile(dir, { ...readStateFile(dir), homeSync: 'off' })
+          st = { ...readStateFile(dir), lastStartAt: st.lastStartAt } // so the start below keeps the mark
+        }
         try {
           const pulled = await homePull(homeCtx)
+          if ('none' in pulled) throw Object.assign(new Error('home-none'), { homeNone: true })
           leaseId = pulled.leaseId
           heldSaid = ''
           homeOff = false
@@ -1134,12 +1143,8 @@ async function daemon(o: Opts, deps: LaunchDeps): Promise<number> {
           event('launch.home.pulled', { fetched: pulled.fetched, deleted: pulled.deleted, conflicts: pulled.conflicts })
           st = { ...readStateFile(dir), lastStartAt: st.lastStartAt }
         } catch (e) {
-          if (homeUnavailable(e)) {
-            homeOff = true
-            leaseId = null
-            if (readStateFile(dir).homeSync !== 'off') writeStateFile(dir, { ...readStateFile(dir), homeSync: 'off' })
-            st = { ...readStateFile(dir), lastStartAt: st.lastStartAt } // so the start below keeps the mark
-          } else {
+          if (homeUnavailable(e) || (e as { homeNone?: boolean })?.homeNone) homeOffNow()
+          else {
             const r = refusalOf(e)
             if (r.code === 'lease-held') {
               const by = typeof r.detail?.machineName === 'string' ? r.detail.machineName : 'another machine'

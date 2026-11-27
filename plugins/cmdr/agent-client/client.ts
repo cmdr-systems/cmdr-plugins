@@ -34,7 +34,7 @@ export function retryAfterMs(h: string | null | undefined, now = Date.now()): nu
 
 /** This plugin's version, as its package.json says it (tests/agent-client/client.spec.ts holds the two together):
  *  what the MCP server names itself and what the socket declares. */
-export const PLUGIN_VERSION = '0.3.25'
+export const PLUGIN_VERSION = '0.3.26'
 /** What this plugin can do that cmdr.mc must know before it acts (general crew channel design § 3.1, AC-10):
  *  `general-channel`, it knows its crew's general channel and no home, so an organization may archive its role channels. */
 export const GENERAL_CHANNEL_CAPABILITY = 'general-channel'
@@ -53,6 +53,14 @@ export type HomeLease = { leaseId: string; epoch: number; expiresAt: string }
 export type SignedWrite = { url: string; method: 'PUT'; headers: Record<string, string> }
 export type HomeLinks = { read: Record<string, string>; write: Record<string, SignedWrite>; present: string[] }
 export type HomeCommitted = { committedAt: string; revision: number; entries: HomeEntry[] }
+export type HomeReportResult = 'ok' | 'failed' | 'held-elsewhere' | 'off'
+/** POST /agent/home/report (design 0.1.25 item 7): one half or both, each with when it happened. */
+export type HomeReport = {
+  /** This machine's name, as the lease takes it (cmdr.mc stores it beside the report). */
+  machineName?: string
+  pull?: { at: string; result: HomeReportResult; fetched: number; deleted: number; setAside: number }
+  push?: { at: string; result: HomeReportResult; put: number; deleted: number; backlog: number; refusal?: string }
+}
 
 /** /agent/me: who the key is (design § 3.2). */
 export type Me = Author & { runsOn?: string; operator?: { id: string; name: string } }
@@ -106,7 +114,11 @@ export class McClient {
   homeLease = (m: { machineId: string; machineName: string }) => this.home<HomeLease>('lease', m.machineId, { method: 'POST', body: m })
   homeManifest = (machineId: string) => this.home<HomeManifest>('manifest', machineId)
   homeLinks = (machineId: string, body: { leaseId: string; read?: string[]; write?: { md5: string; size: number }[] }) => this.home<HomeLinks>('links', machineId, { method: 'POST', body })
-  homeCommit = (machineId: string, body: { leaseId: string; baseRevision: number; put: HomeEntry[]; delete: string[] }) => this.home<HomeCommitted>('commit', machineId, { method: 'POST', body })
+  /** `homeRules`: the home-set version this launcher walked by (design 0.1.25 § 3.1); the route judges the puts by it. */
+  homeCommit = (machineId: string, body: { leaseId: string; baseRevision: number; put: HomeEntry[]; delete: string[]; homeRules: number }) => this.home<HomeCommitted>('commit', machineId, { method: 'POST', body })
+  /** The last pull's or push's outcome on this machine (design 0.1.25 item 7). An older cmdr.mc answers 404; the caller
+   *  never lets this fail a step. */
+  homeReport = (machineId: string, body: HomeReport) => this.home<{ ok: true; warning: string | null }>('report', machineId, { method: 'POST', body })
   homeRelease = (machineId: string, leaseId: string) => this.home<{ released: boolean }>('release', machineId, { method: 'POST', body: { leaseId } })
   /** How one went, once: `done`, or `failed` with why (`stale`, `stopped`, …). */
   actionDone = (id: string, status: 'done' | 'failed', detail?: string) =>
