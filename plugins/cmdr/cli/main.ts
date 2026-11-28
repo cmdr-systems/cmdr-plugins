@@ -45,9 +45,11 @@ export const USAGE = `usage: cmdr-agent <verb> [args]
                                        print each message for you as a <channel …> line, until interrupted; it
                                        declares its scope first (main unless told), as a session does
   sessions                             your live sessions: scope, channel, since
-  home pull|push|release --cwd <dir> [--machine-file <path>] [--deadline <epoch ms>]
+  home pull|push|release --cwd <dir> [--machine-file <path>] [--box-file <path>] [--deadline <epoch ms>]
                                        the agent's home (agent home sync § 3.4), for a box: pull before a start,
-                                       push each round, push and release on a clean stop; prints counts only
+                                       push each round, push and release on a clean stop; prints counts only.
+                                       A box agent's machine is its box (/etc/cmdr-crew/box.json, or --box-file),
+                                       anyone else's ~/.cmdr/machine.json (or --machine-file)
   launch install|run|status|stop|start|uninstall …
                                        the session launcher: a login service that keeps one session of yours
                                        running, until you stop it (cmdr-agent launch --help)
@@ -511,9 +513,9 @@ const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<
   // walk (a box's allowlist), and a platform agent has no home here (`home: none`, exit 0, no lease taken).
   // `--deadline`: the box's start loop's own end (crew-launch), so a pull says what it left instead of being killed.
   home: async (a, ctx) => {
-    const p = parseArgs(a, ['cwd', 'machine-file', 'deadline'])
+    const p = parseArgs(a, ['cwd', 'machine-file', 'box-file', 'deadline'])
     const step = p.pos[0]
-    if (p.pos.length !== 1 || !['pull', 'push', 'release'].includes(step!)) refuse('usage', 'home pull|push|release --cwd <dir> [--machine-file <path>] [--deadline <epoch ms>]')
+    if (p.pos.length !== 1 || !['pull', 'push', 'release'].includes(step!)) refuse('usage', 'home pull|push|release --cwd <dir> [--machine-file <path>] [--box-file <path>] [--deadline <epoch ms>]')
     const cwd = p.opt.cwd ?? refuse('usage', '--cwd <dir>: the agent\'s working directory')
     const deadline = p.opt.deadline === undefined ? undefined : /^\d{1,15}$/.test(p.opt.deadline) ? Number(p.opt.deadline) : refuse('usage', '--deadline <epoch ms>')
     const home = await import('../home/home-sync.js')
@@ -528,8 +530,20 @@ const verbs: Record<Exclude<Verb, 'launch'>, (a: string[], ctx: Ctx) => Promise<
       ctx.deps.out('home: none (runsOn platform)')
       return
     }
-    const { machine } = await import('../home/machine.js')
-    const m = p.opt['machine-file'] ? machine(p.opt['machine-file']) : machine()
+    // The machine follows the same `runsOn` (LOCAL-AGENTS-53, design 0.1.34): a box agent is its box's enrolment
+    // (box.json, whatever `$HOME`), a person's machine its machine.json. A box with no readable box.json fails the step
+    // as machine-unknown, before any lease or file.
+    // --machine-file names a person's machine: on a box it would be silently passed over for box.json, so say so (Ylis).
+    if (scope === 'box' && p.opt['machine-file'] !== undefined) return refuse('usage', "--machine-file is a local agent's: a box agent's machine is its box.json (--box-file)")
+    const { machineFile, machineFor, MachineUnknown } = await import('../home/machine.js')
+    const userHome = ctx.deps.env.HOME
+    let m: import('../home/machine.js').Machine
+    try {
+      m = machineFor(scope, { boxFile: p.opt['box-file'], machineFile: p.opt['machine-file'] ?? (userHome ? machineFile(userHome) : undefined) })
+    } catch (e) {
+      if (e instanceof MachineUnknown) return refuse('machine-unknown', e.message.replace(/^machine-unknown: /, ''))
+      throw e
+    }
     const hctx = { client: ctx.client, machine: m, cwd, memoryDir: home.memoryDirOf(cwd, ctx.deps.env as NodeJS.ProcessEnv), fetch: ctx.deps.fetch, runsOn, ...(deadline !== undefined ? { deadline } : {}) }
     // Agent homes off (design 0.1.15, F897-1): a cmdr.mc without them (404) or with them switched off (503
     // home-unavailable) is the launcher's rule here too. Nothing is touched and the step exits 0, so the unit's
